@@ -1,0 +1,4 @@
+/target/
+/.agent-sync/
+*.log
+.DS_Store
