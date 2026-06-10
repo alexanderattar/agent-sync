@@ -231,6 +231,63 @@ fn discover_reports_codex_claude_and_shared_agent_sources() {
     assert!(output.contains("shared-style"));
 }
 
+#[cfg(unix)]
+#[test]
+fn symlinked_shared_skills_export_as_real_directories() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let real_skill = root.join("external-skills/symlinked-shared");
+    write(
+        &real_skill.join("SKILL.md"),
+        r#"---
+name: symlinked-shared
+description: Symlinked shared skill
+---
+
+# Symlinked Shared
+"#,
+    );
+    std::os::unix::fs::symlink(&real_skill, root.join(".agents/skills/symlinked-shared")).unwrap();
+
+    let pack = root.join("pack");
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+        ],
+    );
+
+    let packed_skill = pack.join("skills/symlinked-shared");
+    assert!(packed_skill.join("SKILL.md").exists());
+    assert!(!fs::symlink_metadata(&packed_skill)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "claude",
+            "--yes",
+        ],
+    );
+
+    let claude_skill = root.join(".claude/skills/symlinked-shared");
+    assert!(claude_skill.join("SKILL.md").exists());
+    assert!(!fs::symlink_metadata(&claude_skill)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
 #[test]
 fn raw_mcp_headers_are_not_exported() {
     let temp = setup_fixture();

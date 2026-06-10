@@ -37,8 +37,9 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
 }
 
 pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    let src = resolve_root_dir(src)?;
     ensure_dir(dst)?;
-    for entry in WalkDir::new(src).follow_links(false) {
+    for entry in WalkDir::new(&src).follow_links(false) {
         let entry = entry?;
         let path = entry.path();
         if should_ignore(path) {
@@ -47,7 +48,7 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
             }
             continue;
         }
-        let rel = path.strip_prefix(src)?;
+        let rel = path.strip_prefix(&src)?;
         if rel.as_os_str().is_empty() {
             continue;
         }
@@ -150,14 +151,15 @@ pub fn hash_path(path: &Path) -> Result<String> {
     if path.is_file() {
         hasher.update(fs::read(path)?);
     } else {
+        let path = resolve_root_dir(path)?;
         let mut entries = Vec::new();
-        for entry in WalkDir::new(path).follow_links(false) {
+        for entry in WalkDir::new(&path).follow_links(false) {
             let entry = entry?;
             let entry_path = entry.path();
             if should_ignore(entry_path) {
                 continue;
             }
-            let rel = entry_path.strip_prefix(path)?;
+            let rel = entry_path.strip_prefix(&path)?;
             if rel.as_os_str().is_empty() {
                 continue;
             }
@@ -192,6 +194,14 @@ pub fn should_ignore(path: &Path) -> bool {
         path.file_name().and_then(|name| name.to_str()),
         Some(".DS_Store" | ".git")
     )
+}
+
+fn resolve_root_dir(path: &Path) -> Result<PathBuf> {
+    if path.is_symlink() && path.is_dir() {
+        fs::canonicalize(path).with_context(|| format!("resolve symlink {}", path.display()))
+    } else {
+        Ok(path.to_path_buf())
+    }
 }
 
 pub fn list_named_skill_dirs(root: &Path) -> Result<Vec<(String, PathBuf)>> {
