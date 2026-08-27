@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 use serde_json::Value;
@@ -17,23 +17,7 @@ fn bin() -> PathBuf {
 }
 
 fn run(root: &Path, args: &[&str]) -> String {
-    let output = Command::new(bin())
-        .env("HOME", root)
-        .args([
-            "--home",
-            root.to_str().unwrap(),
-            "--codex-home",
-            root.join(".codex").to_str().unwrap(),
-            "--claude-home",
-            root.join(".claude").to_str().unwrap(),
-            "--claude-config",
-            root.join(".claude.json").to_str().unwrap(),
-            "--agents-home",
-            root.join(".agents").to_str().unwrap(),
-        ])
-        .args(args)
-        .output()
-        .expect("run agent-sync");
+    let output = run_output(root, args);
 
     if !output.status.success() {
         panic!(
@@ -45,6 +29,41 @@ fn run(root: &Path, args: &[&str]) -> String {
     }
 
     String::from_utf8(output.stdout).expect("stdout utf8")
+}
+
+fn run_failure(root: &Path, args: &[&str]) -> String {
+    let output = run_output(root, args);
+    assert!(
+        !output.status.success(),
+        "agent-sync unexpectedly succeeded\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn run_output(root: &Path, args: &[&str]) -> Output {
+    let output = Command::new(bin())
+        .env("HOME", root)
+        .args([
+            "--home",
+            root.to_str().unwrap(),
+            "--codex-home",
+            root.join(".codex").to_str().unwrap(),
+            "--claude-home",
+            root.join(".claude").to_str().unwrap(),
+            "--claude-config",
+            root.join(".claude.json").to_str().unwrap(),
+            "--cursor-home",
+            root.join(".cursor").to_str().unwrap(),
+            "--cursor-config",
+            root.join(".cursor/mcp.json").to_str().unwrap(),
+            "--agents-home",
+            root.join(".agents").to_str().unwrap(),
+        ])
+        .args(args)
+        .output()
+        .expect("run agent-sync");
+    output
 }
 
 fn setup_fixture() -> TempDir {
@@ -101,6 +120,7 @@ Authorization = "EXAMPLE_MCP_AUTHORIZATION"
 
     fs::create_dir_all(root.join(".claude")).unwrap();
     write(&root.join(".claude.json"), "{}\n");
+    write(&root.join(".cursor/mcp.json"), "{\"mcpServers\": {}}\n");
 
     temp
 }
@@ -227,8 +247,406 @@ fn discover_reports_codex_claude_and_shared_agent_sources() {
     assert!(output.contains("pr-review"));
     assert!(output.contains("Claude"));
     assert!(output.contains("claude-only"));
+    assert!(output.contains("Cursor"));
     assert!(output.contains("Shared .agents"));
     assert!(output.contains("shared-style"));
+}
+
+#[test]
+fn applies_pack_to_cursor_additively_and_preserves_cursor_state() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("cursor-pack");
+
+    write(
+        &root.join(".codex/skills/missing-in-cursor/SKILL.md"),
+        "---\nname: missing-in-cursor\ndescription: Portable skill\n---\n",
+    );
+    let cursor_skill = "---\nname: pr-review\ndescription: Cursor-specific review\n---\n";
+    write(
+        &root.join(".cursor/skills/pr-review/SKILL.md"),
+        cursor_skill,
+    );
+    let cursor_rule =
+        "---\ndescription: Cursor-owned import\nalwaysApply: true\n---\nCursor wins.\n";
+    write(
+        &root.join(".cursor/rules/imported-codex-agents.mdc"),
+        cursor_rule,
+    );
+    write(
+        &root.join(".cursor/rules/cursor-only.mdc"),
+        "---\nalwaysApply: true\n---\nCursor only.\n",
+    );
+    write(
+        &root.join(".cursor/skills-cursor/managed/SKILL.md"),
+        "managed sentinel\n",
+    );
+    write(
+        &root.join(".cursor/plugins/local/sentinel/plugin.json"),
+        "{\"name\":\"sentinel\"}\n",
+    );
+    let cursor_mcp = r#"{
+  "cursorSetting": {"keep": true},
+  "mcpServers": {
+    "qmd": {
+      "url": "http://cursor-specific.invalid/mcp",
+      "cursorOnlyField": true
+    },
+    "cursor-only": {
+      "command": "cursor-tool",
+      "args": ["serve"]
+    }
+  }
+}
+"#;
+    write(&root.join(".cursor/mcp.json"), cursor_mcp);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            root.join(".cursor/mcp.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+    assert!(!pack.join("references/codex-memories").exists());
+    assert!(!pack.join("references/codex-automations").exists());
+    fs::remove_dir_all(root.join(".codex/skills/missing-in-cursor")).unwrap();
+
+    let dry_run = run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(dry_run.contains("Skip cursor Skill:pr-review"));
+    assert!(dry_run.contains("Add cursor Skill:missing-in-cursor"));
+    assert!(dry_run.contains("Skip cursor Rule:codex-agents"));
+    assert!(dry_run.contains("Add cursor Mcp:"));
+
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+
+    assert_eq!(
+        fs::read_to_string(root.join(".cursor/skills/pr-review/SKILL.md")).unwrap(),
+        cursor_skill
+    );
+    assert!(root
+        .join(".cursor/skills/missing-in-cursor/SKILL.md")
+        .exists());
+    assert_eq!(
+        fs::read_to_string(root.join(".cursor/rules/imported-codex-agents.mdc")).unwrap(),
+        cursor_rule
+    );
+    assert!(root.join(".cursor/rules/cursor-only.mdc").exists());
+    assert!(root.join(".cursor/skills-cursor/managed/SKILL.md").exists());
+    assert!(root
+        .join(".cursor/plugins/local/sentinel/plugin.json")
+        .exists());
+
+    let merged_raw = fs::read_to_string(root.join(".cursor/mcp.json")).unwrap();
+    let insertion_at = cursor_mcp.rfind("}\n}\n").unwrap();
+    assert_eq!(
+        &merged_raw.as_bytes()[..insertion_at],
+        &cursor_mcp.as_bytes()[..insertion_at]
+    );
+    assert!(merged_raw.ends_with(&cursor_mcp[insertion_at..]));
+    let insertion_end = merged_raw.len() - (cursor_mcp.len() - insertion_at);
+    assert!(merged_raw[insertion_at..insertion_end].starts_with(",\"example_http\":"));
+
+    let merged: Value = serde_json::from_str(&merged_raw).unwrap();
+    assert_eq!(merged["cursorSetting"]["keep"], true);
+    assert_eq!(
+        merged["mcpServers"]["qmd"]["url"],
+        "http://cursor-specific.invalid/mcp"
+    );
+    assert_eq!(merged["mcpServers"]["qmd"]["cursorOnlyField"], true);
+    assert_eq!(
+        merged["mcpServers"]["cursor-only"]["command"],
+        "cursor-tool"
+    );
+    assert_eq!(
+        merged["mcpServers"]["example_http"]["url"],
+        "https://mcp.example.invalid/mcp"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(root.join(".cursor/mcp.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let verify = run(
+        root,
+        &[
+            "verify",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(verify.contains("Verification passed"));
+
+    let second_diff = run(
+        root,
+        &[
+            "diff",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(!second_diff.contains("Add cursor"));
+    assert!(!second_diff.contains("Update cursor"));
+}
+
+#[test]
+fn cursor_rule_references_live_codex_guidance_without_copying_it() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("cursor-rule-pack");
+    write(
+        &root.join(".codex/AGENTS.md"),
+        "# Global Agent Rules\n\ncredential-bearing-sentinel\n",
+    );
+
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+
+    let imported =
+        fs::read_to_string(root.join(".cursor/rules/imported-codex-agents.mdc")).unwrap();
+    assert!(imported.contains("~/.codex/AGENTS.md"));
+    assert!(imported.contains("Cursor-specific settings and rules take precedence"));
+    assert!(!imported.contains("credential-bearing-sentinel"));
+}
+
+#[test]
+fn cursor_mcp_rejects_malformed_server_map_without_rewriting_it() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let malformed = "{\"mcpServers\": []}\n";
+    write(&root.join(".cursor/mcp.json"), malformed);
+
+    let output = Command::new(bin())
+        .env("HOME", root)
+        .args([
+            "--home",
+            root.to_str().unwrap(),
+            "--cursor-home",
+            root.join(".cursor").to_str().unwrap(),
+            "--cursor-config",
+            root.join(".cursor/mcp.json").to_str().unwrap(),
+            "discover",
+        ])
+        .output()
+        .expect("run agent-sync");
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(root.join(".cursor/mcp.json")).unwrap(),
+        malformed
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_mcp_refuses_a_symlink_instead_of_replacing_it() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("cursor-pack");
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+
+    let config = root.join(".cursor/mcp.json");
+    let shared_config = root.join("shared-cursor/mcp.json");
+    write(&shared_config, "{\"mcpServers\": {}}\n");
+    fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(&shared_config, &config).unwrap();
+
+    let error = run_failure(
+        root,
+        &[
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+    assert!(error.contains("refusing to rewrite symlinked Cursor MCP config"));
+    assert!(fs::symlink_metadata(&config)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::read_to_string(&shared_config).unwrap(),
+        "{\"mcpServers\": {}}\n"
+    );
+}
+
+#[test]
+fn cursor_project_mcp_names_win_without_being_added_to_mcp_json() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("cursor-pack");
+    fs::create_dir_all(root.join(".cursor/projects/example/mcps/qmd")).unwrap();
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+
+    let original = fs::read_to_string(root.join(".cursor/mcp.json")).unwrap();
+    let dry_run = run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(dry_run.contains("Skip cursor Mcp:qmd"));
+    assert!(dry_run.contains("Add cursor Mcp:example_http"));
+
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+    let updated = fs::read_to_string(root.join(".cursor/mcp.json")).unwrap();
+    assert_ne!(updated, original);
+    let updated: Value = serde_json::from_str(&updated).unwrap();
+    assert!(updated["mcpServers"].get("qmd").is_none());
+    assert_eq!(
+        updated["mcpServers"]["example_http"]["url"],
+        "https://mcp.example.invalid/mcp"
+    );
+    let verify = run(
+        root,
+        &[
+            "verify",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(verify.contains("Verification passed"));
+}
+
+#[test]
+fn portable_only_refuses_a_reused_pack_with_references() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("reused-pack");
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+        ],
+    );
+    let manifest_before = fs::read(pack.join("agent-sync.manifest.json")).unwrap();
+
+    let error = run_failure(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+    assert!(error.contains("--portable-only refuses reused pack"));
+    assert!(pack.join("references/codex-memories/MEMORY.md").exists());
+    assert_eq!(
+        fs::read(pack.join("agent-sync.manifest.json")).unwrap(),
+        manifest_before
+    );
 }
 
 #[cfg(unix)]
@@ -330,6 +748,43 @@ fn raw_mcp_headers_are_not_exported() {
     let exported = fs::read_to_string(pack.join("mcp/servers.json")).unwrap();
     assert!(!exported.contains("literal-value-that-should-not-export"));
     assert!(exported.contains("SAFE_AUTH_ENV"));
+}
+
+#[test]
+fn export_can_limit_mcp_servers_to_a_reviewed_allowlist() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("allowlisted-pack");
+
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+
+    let exported: Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("mcp/servers.json")).unwrap()).unwrap();
+    assert!(exported.get("qmd").is_some());
+    assert!(exported.get("example_http").is_none());
+
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("agent-sync.manifest.json")).unwrap())
+            .unwrap();
+    let mcp_names = manifest["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|resource| resource["kind"] == "mcp")
+        .filter_map(|resource| resource["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(mcp_names, vec!["qmd"]);
 }
 
 #[test]

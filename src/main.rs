@@ -4,8 +4,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use agent_sync::{
-    apply_pack, discover, export_pack, format_diff, init_pack, verify_pack, AgentKind, AgentPaths,
-    ApplyOptions, ExportOptions, SourceSelection,
+    apply_pack, discover, export_cursor_history_from_stdin, export_pack, format_diff, init_pack,
+    install_cursor_history_hook, verify_pack, AgentKind, AgentPaths, ApplyOptions, ExportOptions,
+    SourceSelection,
 };
 
 #[derive(Debug, Parser)]
@@ -32,6 +33,12 @@ struct PathArgs {
 
     #[arg(long, env = "AGENT_SYNC_CLAUDE_CONFIG")]
     claude_config: Option<PathBuf>,
+
+    #[arg(long, env = "AGENT_SYNC_CURSOR_HOME")]
+    cursor_home: Option<PathBuf>,
+
+    #[arg(long, env = "AGENT_SYNC_CURSOR_CONFIG")]
+    cursor_config: Option<PathBuf>,
 
     #[arg(long, env = "AGENT_SYNC_AGENTS_HOME")]
     agents_home: Option<PathBuf>,
@@ -60,6 +67,19 @@ enum Command {
 
         #[arg(long = "from", value_enum, default_value_t = SourceArg::All)]
         source: SourceArg,
+
+        #[arg(
+            long,
+            help = "Exclude memory and automation references from the exported pack"
+        )]
+        portable_only: bool,
+
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Export only these MCP server names"
+        )]
+        mcp_servers: Vec<String>,
     },
     Diff {
         #[arg(long)]
@@ -88,6 +108,31 @@ enum Command {
         #[arg(long, default_value = "codex,claude")]
         targets: String,
     },
+    CursorHistory {
+        #[command(subcommand)]
+        command: CursorHistoryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CursorHistoryCommand {
+    Install {
+        #[arg(long)]
+        executable: Option<PathBuf>,
+
+        #[arg(
+            long,
+            help = "Actually write the additive hook. Without this, print the plan only."
+        )]
+        yes: bool,
+    },
+    Export {
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+
+        #[arg(long, hide = true)]
+        skip_qmd: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -110,6 +155,8 @@ fn main() -> Result<()> {
         cli.paths.codex_home,
         cli.paths.claude_home,
         cli.paths.claude_config,
+        cli.paths.cursor_home,
+        cli.paths.cursor_config,
         cli.paths.agents_home,
     )?;
 
@@ -135,12 +182,19 @@ fn main() -> Result<()> {
                 OutputFormat::Text => print!("{}", inventory.to_text()),
             }
         }
-        Command::Export { pack, source } => {
+        Command::Export {
+            pack,
+            source,
+            portable_only,
+            mcp_servers,
+        } => {
             let report = export_pack(
                 &paths,
                 &pack,
                 ExportOptions {
                     source: source.into(),
+                    include_references: !portable_only,
+                    mcp_servers,
                 },
             )?;
             print!("{}", report.to_text());
@@ -163,6 +217,20 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::CursorHistory { command } => match command {
+            CursorHistoryCommand::Install { executable, yes } => {
+                let executable = executable.unwrap_or(std::env::current_exe()?);
+                let report = install_cursor_history_hook(&paths, &executable, !yes)?;
+                print!("{}", report.to_text());
+            }
+            CursorHistoryCommand::Export {
+                output_dir,
+                skip_qmd,
+            } => {
+                export_cursor_history_from_stdin(&paths, output_dir, !skip_qmd)?;
+                println!("{{}}");
+            }
+        },
     }
 
     Ok(())
@@ -188,7 +256,8 @@ fn parse_targets(raw: &str) -> Result<Vec<AgentKind>> {
         let target = match part {
             "codex" => AgentKind::Codex,
             "claude" => AgentKind::Claude,
-            other => anyhow::bail!("unknown target `{other}`; expected codex or claude"),
+            "cursor" => AgentKind::Cursor,
+            other => anyhow::bail!("unknown target `{other}`; expected codex, claude, or cursor"),
         };
         if !out.contains(&target) {
             out.push(target);

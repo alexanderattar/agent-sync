@@ -23,9 +23,16 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
             .map(|extension| format!("{extension}."))
             .unwrap_or_default()
     ));
+    let existing_permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
     {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("create temp file {}", tmp.display()))?;
+        if let Some(permissions) = existing_permissions {
+            fs::set_permissions(&tmp, permissions)
+                .with_context(|| format!("preserve permissions for {}", path.display()))?;
+        }
         file.write_all(content)
             .with_context(|| format!("write temp file {}", tmp.display()))?;
         file.sync_all()

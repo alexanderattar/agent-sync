@@ -1,7 +1,7 @@
 # agent-sync
 
 `agent-sync` is a Rust CLI for syncing your own local agent tooling between
-coding agents like Codex and Claude Code.
+coding agents like Codex, Claude Code, and Cursor.
 
 The important part is "your own". This is not meant to be a shared dump of my
 skills, memories, MCP config, or private setup. The tool can be shared, but each
@@ -44,6 +44,7 @@ Bad examples:
 - MCP servers from Claude `~/.claude.json`.
 - Codex memories as Claude-side reference imports.
 - Codex automations as reference templates in the exported pack.
+- Cursor user skills, rules, and MCP server names for inventory and verification.
 
 Some conversions are intentionally conservative:
 
@@ -51,7 +52,13 @@ Some conversions are intentionally conservative:
   `~/.claude/rules/imported-codex-agents.md`.
 - Claude `CLAUDE.md` is exported as a Claude-targeted rule. It is not rewritten
   into Codex guidance yet.
-- Skills and MCP server definitions can target both Codex and Claude.
+- Skills and MCP server definitions can target Codex, Claude, and Cursor.
+- Cursor reads Codex, Claude, and shared `.agents` skills directly. The Cursor
+  target reuses those live directories instead of creating duplicate skills.
+- Cursor MCP sync is additive. Existing same-name Cursor entries always win.
+- Codex global guidance uses the separate Cursor rule
+  `~/.cursor/rules/imported-codex-agents.mdc`. A differing existing file is
+  preserved and reported as a conflict skip.
 - Codex automations are exported into the pack but are not installed into
   Claude, because Claude does not have the same automation runtime.
 
@@ -68,6 +75,9 @@ That means:
 - No hosted connector sessions.
 - No browser login state.
 - No team-wide auth state.
+- No Codex or Cursor plugin installation state.
+- No Cursor settings, managed skills, plugin cache, chat database, or editor
+  state.
 
 For MCP servers, the tool tries to preserve references to environment variables
 instead of copying the secret values themselves.
@@ -116,7 +126,8 @@ There are three concepts that matter:
 
 - **Source**: where the pack is exported from. `codex`, `claude`, or `all`.
 - **Pack**: a local directory containing the exported resources and manifest.
-- **Target**: where the pack is applied. `codex`, `claude`, or both.
+- **Target**: where the pack is applied. `codex`, `claude`, `cursor`, or a
+  comma-separated combination.
 
 A pack is just files. Treat it like a backup of your agent setup. If your agent
 setup contains private context, the pack probably does too.
@@ -182,6 +193,57 @@ After a successful apply, a second diff should be unchanged:
 ```bash
 agent-sync diff --pack ./my-agent-pack --targets claude
 ```
+
+### Bring Portable Codex Setup Into Cursor
+
+Cursor already loads `~/.codex/skills` and `~/.agents/skills`. This workflow
+adds the remaining portable configuration without copying memories or
+automation definitions into the pack:
+
+```bash
+agent-sync export \
+  --pack ~/.agent-sync/packs/codex-cursor \
+  --from codex \
+  --portable-only \
+  --mcp-servers qmd,exa,figma,grep,openaiDeveloperDocs,parallel-search,playwright,sequential-thinking,todoist
+agent-sync diff --pack ~/.agent-sync/packs/codex-cursor --targets cursor
+agent-sync apply --pack ~/.agent-sync/packs/codex-cursor --targets cursor
+agent-sync apply --pack ~/.agent-sync/packs/codex-cursor --targets cursor --yes
+agent-sync verify --pack ~/.agent-sync/packs/codex-cursor --targets cursor
+```
+
+The Cursor apply rules are intentionally strict:
+
+- Existing differing Cursor skills and imported rules are skipped.
+- The imported Cursor rule references the live `~/.codex/AGENTS.md` file. It
+  does not duplicate that file's contents, and Cursor-specific rules still win.
+- Existing same-name Cursor MCP entries remain byte-for-byte unchanged.
+- MCP names already supplied by a Cursor project or plugin are skipped.
+- Missing MCP entries are added while all unrelated JSON fields are preserved.
+- `--mcp-servers` limits unattended sync to explicitly reviewed servers.
+- The mode of an existing `~/.cursor/mcp.json` file is preserved.
+- A symlinked `~/.cursor/mcp.json` is refused instead of replaced.
+
+`--portable-only` refuses a reused pack whose `references` directory is not
+empty. Use an empty pack path so old memories or automation definitions cannot
+remain in the portable pack.
+
+Codex and Cursor keep separate plugin formats and chat databases. Use the Codex
+extension inside Cursor for the actual Codex runtime. Use QMD for searchable
+history across agents.
+
+Install the optional Cursor transcript exporter after installing the release
+binary at a stable path:
+
+```bash
+agent-sync cursor-history install
+agent-sync cursor-history install --yes
+```
+
+This merges one `stop` hook into `~/.cursor/hooks.json` without replacing any
+existing hook. It exports user and assistant text to
+`~/Documents/Obsidian/sessions` and refreshes the QMD index. It does not copy
+tool calls or modify Cursor's chat database.
 
 ## Common Workflows
 
@@ -305,6 +367,8 @@ By default, the tool uses:
 ~/.codex
 ~/.claude
 ~/.claude.json
+~/.cursor
+~/.cursor/mcp.json
 ~/.agents
 ```
 
@@ -316,6 +380,8 @@ agent-sync \
   --codex-home /tmp/example/.codex \
   --claude-home /tmp/example/.claude \
   --claude-config /tmp/example/.claude.json \
+  --cursor-home /tmp/example/.cursor \
+  --cursor-config /tmp/example/.cursor/mcp.json \
   --agents-home /tmp/example/.agents \
   discover
 ```
@@ -326,6 +392,8 @@ Equivalent environment variables:
 - `AGENT_SYNC_CODEX_HOME`
 - `AGENT_SYNC_CLAUDE_HOME`
 - `AGENT_SYNC_CLAUDE_CONFIG`
+- `AGENT_SYNC_CURSOR_HOME`
+- `AGENT_SYNC_CURSOR_CONFIG`
 - `AGENT_SYNC_AGENTS_HOME`
 
 ## Commands
@@ -356,6 +424,7 @@ Export a pack:
 agent-sync export --pack ./my-agent-pack --from all
 agent-sync export --pack ./codex-pack --from codex
 agent-sync export --pack ./claude-pack --from claude
+agent-sync export --pack ./cursor-pack --from codex --portable-only
 ```
 
 Preview changes:
@@ -363,6 +432,7 @@ Preview changes:
 ```bash
 agent-sync diff --pack ./my-agent-pack --targets claude
 agent-sync diff --pack ./my-agent-pack --targets codex,claude
+agent-sync diff --pack ./my-agent-pack --targets cursor
 ```
 
 Apply in dry-run mode:
@@ -381,6 +451,7 @@ Verify after applying:
 
 ```bash
 agent-sync verify --pack ./my-agent-pack --targets claude
+agent-sync verify --pack ./my-agent-pack --targets cursor
 ```
 
 ## Development

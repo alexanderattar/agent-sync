@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +14,11 @@ use crate::{
         replace_file_with_backup,
     },
     manifest::{Manifest, Resource, ResourceKind},
-    mcp::{load_pack_mcp, write_claude_mcp, write_codex_mcp, McpServer},
+    mcp::{
+        discover_cursor_effective_mcp_names, discover_cursor_mcp_names,
+        discover_cursor_project_mcp_names, ensure_cursor_mcp_write_safe, load_pack_mcp,
+        write_claude_mcp, write_codex_mcp, write_cursor_mcp_additive, McpServer,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,9 +101,9 @@ pub fn diff_pack(paths: &AgentPaths, pack: &Path, targets: &[AgentKind]) -> Resu
                 continue;
             };
             let action = match resource.kind {
-                ResourceKind::Mcp => mcp_change_action(paths, &mcp, *target)?,
+                ResourceKind::Mcp => mcp_change_action(paths, &mcp, &resource.name, *target)?,
                 ResourceKind::Rule => rule_change_action(pack, resource, *target, &destination)?,
-                _ => file_change_action(pack, resource, &destination)?,
+                _ => file_change_action(pack, resource, *target, &destination)?,
             };
             changes.push(Change {
                 action,
@@ -110,7 +114,7 @@ pub fn diff_pack(paths: &AgentPaths, pack: &Path, targets: &[AgentKind]) -> Resu
             });
         }
     }
-    dedupe_mcp_changes(changes)
+    Ok(changes)
 }
 
 pub fn apply_pack(
@@ -141,6 +145,12 @@ pub fn apply_pack(
     for resource in &manifest.resources {
         for target in targets {
             if !resource.targets.contains(target) {
+                continue;
+            }
+            if matches!(
+                planned_action(&changes, *target, resource),
+                Some(ChangeAction::Skip | ChangeAction::Unchanged)
+            ) {
                 continue;
             }
             match resource.kind {
@@ -256,6 +266,17 @@ pub fn verify_pack(paths: &AgentPaths, pack: &Path, targets: &[AgentKind]) -> Re
                     }
                 }
             }
+            AgentKind::Cursor => {
+                let existing =
+                    discover_cursor_effective_mcp_names(&paths.cursor_home, &paths.cursor_config)?;
+                for name in mcp.keys() {
+                    if existing.contains(name) {
+                        checks.push(format!("cursor mcp `{name}` configured"));
+                    } else {
+                        errors.push(format!("cursor mcp `{name}` missing"));
+                    }
+                }
+            }
         }
     }
 
@@ -291,6 +312,23 @@ fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -
         (ResourceKind::Skill, AgentKind::Claude) => {
             Some(paths.claude_home.join("skills").join(&resource.name))
         }
+        (ResourceKind::Skill, AgentKind::Cursor) => {
+            let cursor_owned = paths.cursor_home.join("skills").join(&resource.name);
+            if cursor_owned.exists() {
+                return Some(cursor_owned);
+            }
+            let shared = match resource.source_agent.as_str() {
+                "codex" => paths.codex_home.join("skills").join(&resource.name),
+                "claude" => paths.claude_home.join("skills").join(&resource.name),
+                "agents" => paths.agents_home.join("skills").join(&resource.name),
+                _ => cursor_owned.clone(),
+            };
+            if shared.exists() {
+                Some(shared)
+            } else {
+                Some(cursor_owned)
+            }
+        }
         (ResourceKind::Rule, AgentKind::Codex) if resource.name == "codex-agents" => {
             Some(paths.codex_home.join("AGENTS.md"))
         }
@@ -303,8 +341,15 @@ fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -
         (ResourceKind::Rule, AgentKind::Claude) if resource.name == "claude-user" => {
             Some(paths.claude_home.join("CLAUDE.md"))
         }
+        (ResourceKind::Rule, AgentKind::Cursor) if resource.name == "codex-agents" => Some(
+            paths
+                .cursor_home
+                .join("rules")
+                .join("imported-codex-agents.mdc"),
+        ),
         (ResourceKind::Mcp, AgentKind::Codex) => Some(paths.codex_home.join("config.toml")),
         (ResourceKind::Mcp, AgentKind::Claude) => Some(paths.claude_config.clone()),
+        (ResourceKind::Mcp, AgentKind::Cursor) => Some(paths.cursor_config.clone()),
         (ResourceKind::MemoryReference, AgentKind::Claude) => Some(
             paths
                 .claude_home
@@ -318,6 +363,7 @@ fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -
 fn file_change_action(
     pack: &Path,
     resource: &Resource,
+    target: AgentKind,
     destination: &Path,
 ) -> Result<ChangeAction> {
     let source = pack.join(&resource.pack_path);
@@ -325,6 +371,8 @@ fn file_change_action(
         Ok(ChangeAction::Add)
     } else if path_content_equal(&source, destination)? {
         Ok(ChangeAction::Unchanged)
+    } else if target == AgentKind::Cursor {
+        Ok(ChangeAction::Skip)
     } else {
         Ok(ChangeAction::Update)
     }
@@ -341,6 +389,8 @@ fn rule_change_action(
         Ok(ChangeAction::Add)
     } else if read_to_string_if_exists(destination)?.as_deref() == Some(content.as_str()) {
         Ok(ChangeAction::Unchanged)
+    } else if target == AgentKind::Cursor {
+        Ok(ChangeAction::Skip)
     } else {
         Ok(ChangeAction::Update)
     }
@@ -349,33 +399,49 @@ fn rule_change_action(
 fn mcp_change_action(
     paths: &AgentPaths,
     mcp: &BTreeMap<String, McpServer>,
+    name: &str,
     target: AgentKind,
 ) -> Result<ChangeAction> {
+    let Some(server) = mcp.get(name) else {
+        bail!("manifest MCP `{name}` is missing from mcp/servers.json");
+    };
     let existing = match target {
         AgentKind::Codex => crate::mcp::discover_codex_mcp(&paths.codex_home.join("config.toml"))?,
         AgentKind::Claude => crate::mcp::discover_claude_mcp(&paths.claude_config)?,
+        AgentKind::Cursor => {
+            let configured = discover_cursor_mcp_names(&paths.cursor_config)?;
+            if configured.contains(name) {
+                return Ok(ChangeAction::Unchanged);
+            }
+            let project_owned = discover_cursor_project_mcp_names(&paths.cursor_home)?;
+            if project_owned.contains(name) {
+                return Ok(ChangeAction::Skip);
+            }
+            ensure_cursor_mcp_write_safe(&paths.cursor_config)?;
+            return Ok(ChangeAction::Add);
+        }
     };
-    let missing = mcp
-        .iter()
-        .any(|(name, server)| existing.get(name) != Some(server));
-    Ok(if missing && existing.is_empty() {
-        ChangeAction::Add
-    } else if missing {
-        ChangeAction::Update
-    } else {
+    Ok(if existing.get(name) == Some(server) {
         ChangeAction::Unchanged
+    } else if existing.is_empty() {
+        ChangeAction::Add
+    } else {
+        ChangeAction::Update
     })
 }
 
 fn rendered_rule(pack: &Path, resource: &Resource, target: AgentKind) -> Result<String> {
     let raw = std::fs::read_to_string(pack.join(&resource.pack_path))?;
-    if resource.name == "codex-agents" && target == AgentKind::Claude {
-        Ok(format!(
+    match (resource.name.as_str(), target) {
+        ("codex-agents", AgentKind::Claude) => Ok(format!(
             "# Imported Codex Agent Rules\n\nImported by `agent-sync` from pack resource `codex-agents`.\n\n{}",
             raw
-        ))
-    } else {
-        Ok(raw)
+        )),
+        ("codex-agents", AgentKind::Cursor) => Ok(
+            "---\ndescription: Bridge to Codex global agent rules\nalwaysApply: true\n---\n# Codex Agent Rule Bridge\n\nBefore starting a task, read and follow `~/.codex/AGENTS.md` when it exists. Treat it as shared guidance. Direct user instructions and Cursor-specific settings and rules take precedence if they conflict with that file.\n\nWhen prior work may matter, search the QMD `sessions` collection. QMD history is searchable context, not a resumable Cursor chat.\n"
+                .to_string(),
+        ),
+        _ => Ok(raw),
     }
 }
 
@@ -395,6 +461,24 @@ fn apply_mcp(
             let content = write_codex_mcp(&path, mcp)?;
             replace_file_with_backup(backup_root, &paths.codex_home, &path, &content)
         }
+        AgentKind::Cursor => {
+            let project_owned = discover_cursor_project_mcp_names(&paths.cursor_home)?;
+            let addable = mcp
+                .iter()
+                .filter(|(name, _)| !project_owned.contains(*name))
+                .map(|(name, server)| (name.clone(), server.clone()))
+                .collect();
+            let content = write_cursor_mcp_additive(&paths.cursor_config, &addable)?;
+            if paths.cursor_config.exists() && std::fs::read(&paths.cursor_config)? == content {
+                return Ok(None);
+            }
+            replace_file_with_backup(
+                backup_root,
+                &paths.cursor_home,
+                &paths.cursor_config,
+                &content,
+            )
+        }
     }
 }
 
@@ -402,7 +486,20 @@ fn agent_root(paths: &AgentPaths, target: AgentKind) -> &Path {
     match target {
         AgentKind::Codex => &paths.codex_home,
         AgentKind::Claude => &paths.claude_home,
+        AgentKind::Cursor => &paths.cursor_home,
     }
+}
+
+fn planned_action(
+    changes: &[Change],
+    target: AgentKind,
+    resource: &Resource,
+) -> Option<ChangeAction> {
+    let label = resource_label(resource);
+    changes
+        .iter()
+        .find(|change| change.target == target && change.resource == label)
+        .map(|change| change.action)
 }
 
 fn resource_label(resource: &Resource) -> String {
@@ -433,24 +530,12 @@ fn mcp_needs_apply(changes: &[Change], target: AgentKind) -> bool {
 
 fn update_mcp_backup(changes: &mut [Change], target: AgentKind, backup: Option<PathBuf>) {
     for change in changes {
-        if change.target == target && change.resource.starts_with("Mcp:") {
+        if change.target == target
+            && change.resource.starts_with("Mcp:")
+            && matches!(change.action, ChangeAction::Add | ChangeAction::Update)
+        {
             change.backup = backup.clone();
             break;
         }
     }
-}
-
-fn dedupe_mcp_changes(changes: Vec<Change>) -> Result<Vec<Change>> {
-    let mut out = Vec::new();
-    let mut seen_mcp = std::collections::BTreeSet::new();
-    for change in changes {
-        if change.resource.starts_with("Mcp:") {
-            let key = change.target;
-            if !seen_mcp.insert(key) {
-                continue;
-            }
-        }
-        out.push(change);
-    }
-    Ok(out)
 }

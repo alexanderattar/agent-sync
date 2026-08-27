@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::{
     adapters::{AgentKind, AgentPaths},
@@ -17,9 +17,11 @@ pub enum SourceSelection {
     Claude,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExportOptions {
     pub source: SourceSelection,
+    pub include_references: bool,
+    pub mcp_servers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,10 +87,21 @@ pub fn export_pack(
     options: ExportOptions,
 ) -> Result<ExportReport> {
     ensure_dir(pack)?;
+    let references = pack.join("references");
+    if !options.include_references
+        && references.exists()
+        && fs::read_dir(&references)?.next().transpose()?.is_some()
+    {
+        bail!(
+            "--portable-only refuses reused pack {} because {} contains references; use an empty pack path",
+            pack.display(),
+            references.display()
+        );
+    }
     ensure_dir(&pack.join("skills"))?;
     ensure_dir(&pack.join("rules"))?;
     ensure_dir(&pack.join("mcp"))?;
-    ensure_dir(&pack.join("references"))?;
+    ensure_dir(&references)?;
 
     let inventory = discover(paths)?;
     let mut manifest = Manifest::new();
@@ -144,13 +157,15 @@ pub fn export_pack(
             source_agent,
             pack_path: dest.strip_prefix(pack)?.to_string_lossy().to_string(),
             sha256: hash_path(&dest)?,
-            targets: vec![AgentKind::Codex, AgentKind::Claude],
+            targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
         });
     }
 
-    export_rules(paths, pack, options, &mut manifest)?;
-    export_references(paths, pack, options, &mut manifest)?;
-    export_mcp(paths, pack, options, &mut manifest)?;
+    export_rules(paths, pack, &options, &mut manifest)?;
+    if options.include_references {
+        export_references(paths, pack, &options, &mut manifest)?;
+    }
+    export_mcp(paths, pack, &options, &mut manifest)?;
 
     manifest.save(pack)?;
     Ok(ExportReport {
@@ -163,7 +178,7 @@ pub fn export_pack(
 fn export_rules(
     paths: &AgentPaths,
     pack: &Path,
-    options: ExportOptions,
+    options: &ExportOptions,
     manifest: &mut Manifest,
 ) -> Result<()> {
     if matches!(
@@ -181,7 +196,7 @@ fn export_rules(
                 source_agent: "codex".to_string(),
                 pack_path: dest.strip_prefix(pack)?.to_string_lossy().to_string(),
                 sha256: hash_path(&dest)?,
-                targets: vec![AgentKind::Codex, AgentKind::Claude],
+                targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
             });
         }
     }
@@ -207,7 +222,7 @@ fn export_rules(
 fn export_references(
     paths: &AgentPaths,
     pack: &Path,
-    options: ExportOptions,
+    options: &ExportOptions,
     manifest: &mut Manifest,
 ) -> Result<()> {
     if matches!(
@@ -254,7 +269,7 @@ fn export_references(
 fn export_mcp(
     paths: &AgentPaths,
     pack: &Path,
-    options: ExportOptions,
+    options: &ExportOptions,
     manifest: &mut Manifest,
 ) -> Result<()> {
     let mut servers: BTreeMap<String, McpServer> = BTreeMap::new();
@@ -263,6 +278,9 @@ fn export_mcp(
         SourceSelection::All | SourceSelection::Codex
     ) {
         for (name, server) in discover_codex_mcp(&paths.codex_home.join("config.toml"))? {
+            if !mcp_selected(options, &name) {
+                continue;
+            }
             servers.entry(name).or_insert(server);
         }
     }
@@ -271,6 +289,9 @@ fn export_mcp(
         SourceSelection::All | SourceSelection::Claude
     ) {
         for (name, server) in discover_claude_mcp(&paths.claude_config)? {
+            if !mcp_selected(options, &name) {
+                continue;
+            }
             servers.entry(name).or_insert(server);
         }
     }
@@ -286,8 +307,12 @@ fn export_mcp(
             source_agent: "mixed".to_string(),
             pack_path: "mcp/servers.json".to_string(),
             sha256: hash_path(&mcp_path)?,
-            targets: vec![AgentKind::Codex, AgentKind::Claude],
+            targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
         });
     }
     Ok(())
+}
+
+fn mcp_selected(options: &ExportOptions, name: &str) -> bool {
+    options.mcp_servers.is_empty() || options.mcp_servers.iter().any(|selected| selected == name)
 }
