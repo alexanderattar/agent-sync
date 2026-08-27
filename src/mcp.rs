@@ -129,6 +129,30 @@ pub fn discover_cursor_mcp_names(path: &Path) -> Result<BTreeSet<String>> {
     Ok(servers.keys().cloned().collect())
 }
 
+pub fn discover_cursor_mcp(path: &Path) -> Result<BTreeMap<String, McpServer>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let root: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    let root = root
+        .as_object()
+        .with_context(|| format!("{} must contain a JSON object", path.display()))?;
+    let Some(servers) = root.get("mcpServers") else {
+        return Ok(BTreeMap::new());
+    };
+    let servers = servers
+        .as_object()
+        .with_context(|| format!("{}.mcpServers must be a JSON object", path.display()))?;
+    Ok(servers
+        .iter()
+        .filter_map(|(name, value)| {
+            mcp_from_claude_value(value).map(|server| (name.clone(), server))
+        })
+        .collect())
+}
+
 pub fn discover_cursor_project_mcp_names(cursor_home: &Path) -> Result<BTreeSet<String>> {
     let projects = cursor_home.join("projects");
     if !projects.exists() {
@@ -146,8 +170,28 @@ pub fn discover_cursor_project_mcp_names(cursor_home: &Path) -> Result<BTreeSet<
         for entry in
             fs::read_dir(&mcp_dir).with_context(|| format!("read {}", mcp_dir.display()))?
         {
-            if let Some(name) = entry?.file_name().to_str() {
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str() {
                 names.insert(name.to_string());
+            }
+            let metadata_path = entry.path().join("SERVER_METADATA.json");
+            match fs::read_to_string(&metadata_path) {
+                Ok(raw) => {
+                    let metadata: Value = serde_json::from_str(&raw)
+                        .with_context(|| format!("parse {}", metadata_path.display()))?;
+                    let server_name = metadata
+                        .get("serverName")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .with_context(|| {
+                            format!("{} has no serverName", metadata_path.display())
+                        })?;
+                    names.insert(server_name.to_string());
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("read {}", metadata_path.display()))
+                }
             }
         }
     }

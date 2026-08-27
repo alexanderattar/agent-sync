@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    adapters::AgentPaths,
+    adapters::{AgentKind, AgentPaths},
     fsx::{list_named_skill_dirs, read_to_string_if_exists},
     mcp::{discover_claude_mcp, discover_codex_mcp, discover_cursor_effective_mcp_names},
 };
@@ -66,14 +66,26 @@ pub struct NamedPath {
 
 pub fn discover(paths: &AgentPaths) -> Result<Inventory> {
     Ok(Inventory {
-        codex: discover_codex(paths)?,
-        claude: discover_claude(paths)?,
-        cursor: discover_cursor(paths)?,
-        shared_agents: discover_agents(paths)?,
+        codex: discover_agent(paths, AgentKind::Codex, true)?,
+        claude: discover_agent(paths, AgentKind::Claude, true)?,
+        cursor: discover_agent(paths, AgentKind::Cursor, true)?,
+        shared_agents: discover_shared_agents(paths)?,
     })
 }
 
-fn discover_cursor(paths: &AgentPaths) -> Result<AgentInventory> {
+pub fn discover_agent(
+    paths: &AgentPaths,
+    agent: AgentKind,
+    include_mcp: bool,
+) -> Result<AgentInventory> {
+    match agent {
+        AgentKind::Codex => discover_codex(paths, include_mcp),
+        AgentKind::Claude => discover_claude(paths, include_mcp),
+        AgentKind::Cursor => discover_cursor(paths, include_mcp),
+    }
+}
+
+fn discover_cursor(paths: &AgentPaths, include_mcp: bool) -> Result<AgentInventory> {
     let home = paths.cursor_home.clone();
     let skills = list_named_skill_dirs(&home.join("skills"))?
         .into_iter()
@@ -101,19 +113,24 @@ fn discover_cursor(paths: &AgentPaths) -> Result<AgentInventory> {
         rules.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
+    let mcp_servers = if include_mcp {
+        discover_cursor_effective_mcp_names(&paths.cursor_home, &paths.cursor_config)?
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(AgentInventory {
         home,
         skills,
         rules,
-        mcp_servers: discover_cursor_effective_mcp_names(&paths.cursor_home, &paths.cursor_config)?
-            .into_iter()
-            .collect(),
+        mcp_servers,
         memories: Vec::new(),
         automations: Vec::new(),
     })
 }
 
-fn discover_codex(paths: &AgentPaths) -> Result<AgentInventory> {
+fn discover_codex(paths: &AgentPaths, include_mcp: bool) -> Result<AgentInventory> {
     let home = paths.codex_home.clone();
     let skills = list_named_skill_dirs(&home.join("skills"))?
         .into_iter()
@@ -130,9 +147,13 @@ fn discover_codex(paths: &AgentPaths) -> Result<AgentInventory> {
 
     let memories = list_files_named(&home.join("memories"), &["MEMORY.md", "memory_summary.md"])?;
     let automations = list_automation_files(&home.join("automations"))?;
-    let mcp_servers = discover_codex_mcp(&home.join("config.toml"))?
-        .into_keys()
-        .collect();
+    let mcp_servers = if include_mcp {
+        discover_codex_mcp(&home.join("config.toml"))?
+            .into_keys()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(AgentInventory {
         home,
@@ -144,7 +165,7 @@ fn discover_codex(paths: &AgentPaths) -> Result<AgentInventory> {
     })
 }
 
-fn discover_claude(paths: &AgentPaths) -> Result<AgentInventory> {
+fn discover_claude(paths: &AgentPaths, include_mcp: bool) -> Result<AgentInventory> {
     let home = paths.claude_home.clone();
     let skills = list_named_skill_dirs(&home.join("skills"))?
         .into_iter()
@@ -174,9 +195,13 @@ fn discover_claude(paths: &AgentPaths) -> Result<AgentInventory> {
         }
     }
 
-    let mcp_servers = discover_claude_mcp(&paths.claude_config)?
-        .into_keys()
-        .collect();
+    let mcp_servers = if include_mcp {
+        discover_claude_mcp(&paths.claude_config)?
+            .into_keys()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(AgentInventory {
         home,
@@ -188,7 +213,7 @@ fn discover_claude(paths: &AgentPaths) -> Result<AgentInventory> {
     })
 }
 
-fn discover_agents(paths: &AgentPaths) -> Result<AgentInventory> {
+pub fn discover_shared_agents(paths: &AgentPaths) -> Result<AgentInventory> {
     let home = paths.agents_home.clone();
     let skills = list_named_skill_dirs(&home.join("skills"))?
         .into_iter()

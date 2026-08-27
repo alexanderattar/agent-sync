@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::{
     adapters::{AgentKind, AgentPaths},
-    discover::discover,
+    discover::{discover_agent, discover_shared_agents},
     fsx::{copy_dir, ensure_dir, hash_path},
     manifest::{Manifest, Resource, ResourceKind},
     mcp::{discover_claude_mcp, discover_codex_mcp, save_pack_mcp, McpServer},
@@ -21,6 +21,7 @@ pub enum SourceSelection {
 pub struct ExportOptions {
     pub source: SourceSelection,
     pub include_references: bool,
+    pub include_mcp: bool,
     pub mcp_servers: Vec<String>,
 }
 
@@ -103,30 +104,47 @@ pub fn export_pack(
     ensure_dir(&pack.join("mcp"))?;
     ensure_dir(&references)?;
 
-    let inventory = discover(paths)?;
-    let mut manifest = Manifest::new();
-    let mut chosen_skills: BTreeMap<String, (String, std::path::PathBuf)> = BTreeMap::new();
-
-    if matches!(
+    let codex_inventory = if matches!(
         options.source,
         SourceSelection::All | SourceSelection::Codex
     ) {
-        for skill in inventory.codex.skills {
+        Some(discover_agent(paths, AgentKind::Codex, false)?)
+    } else {
+        None
+    };
+    let claude_inventory = if matches!(
+        options.source,
+        SourceSelection::All | SourceSelection::Claude
+    ) {
+        Some(discover_agent(paths, AgentKind::Claude, false)?)
+    } else {
+        None
+    };
+    let shared_inventory = if codex_inventory.is_some() {
+        Some(discover_shared_agents(paths)?)
+    } else {
+        None
+    };
+    let mut manifest = Manifest::new();
+    let mut chosen_skills: BTreeMap<String, (String, std::path::PathBuf)> = BTreeMap::new();
+
+    if let Some(inventory) = codex_inventory {
+        for skill in inventory.skills {
             chosen_skills
                 .entry(skill.name)
                 .or_insert(("codex".to_string(), skill.path));
         }
-        for skill in inventory.shared_agents.skills {
+        for skill in shared_inventory
+            .expect("shared inventory exists for Codex exports")
+            .skills
+        {
             chosen_skills
                 .entry(skill.name)
                 .or_insert(("agents".to_string(), skill.path));
         }
     }
-    if matches!(
-        options.source,
-        SourceSelection::All | SourceSelection::Claude
-    ) {
-        for skill in inventory.claude.skills {
+    if let Some(inventory) = claude_inventory {
+        for skill in inventory.skills {
             match chosen_skills.entry(skill.name.clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(("claude".to_string(), skill.path));
@@ -165,7 +183,9 @@ pub fn export_pack(
     if options.include_references {
         export_references(paths, pack, &options, &mut manifest)?;
     }
-    export_mcp(paths, pack, &options, &mut manifest)?;
+    if options.include_mcp {
+        export_mcp(paths, pack, &options, &mut manifest)?;
+    }
 
     manifest.save(pack)?;
     Ok(ExportReport {
