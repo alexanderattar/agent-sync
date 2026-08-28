@@ -3,7 +3,7 @@ use std::{
     error::Error as StdError,
     fmt,
     fs::{self, OpenOptions},
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1647,6 +1647,10 @@ fn collect_missing_qmd_exports(
         .max()
         .unwrap_or_default()
         .saturating_add(4_096);
+    let mut stdout = tempfile::tempfile().context("create QMD exact lookup output file")?;
+    let child_stdout = stdout
+        .try_clone()
+        .context("clone QMD exact lookup output file")?;
     let output = Command::new(qmd)
         .args([
             "multi-get",
@@ -1655,13 +1659,21 @@ fn collect_missing_qmd_exports(
             "--max-bytes",
             &max_bytes.to_string(),
         ])
+        .stdout(Stdio::from(child_stdout))
         .output()
         .context("check exact Cursor history exports in QMD")?;
     if !output.status.success() {
         missing.extend(chunk.iter().map(|lookup| lookup.export.clone()));
         return Ok(());
     }
-    let indexed: Value = serde_json::from_slice(&output.stdout)
+    stdout
+        .seek(SeekFrom::Start(0))
+        .context("rewind QMD exact lookup output")?;
+    let mut stdout_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .context("read QMD exact lookup output")?;
+    let indexed: Value = serde_json::from_slice(&stdout_bytes)
         .context("parse exact Cursor history exports returned by QMD")?;
     let Some(documents) = indexed.as_array() else {
         anyhow::bail!("qmd multi-get did not return a JSON array");
@@ -2878,6 +2890,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn qmd_large_single_line_uses_file_stdout_and_detects_late_staleness() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let output_dir = default_cursor_history_output_dir(&paths);
+        fs::create_dir_all(&output_dir).unwrap();
+        let export = output_dir.join("cursor-large.md");
+        let body = format!("{}\n", "x".repeat(120_000));
+        fs::write(&export, &body).unwrap();
+        let log = temp.path().join("qmd.log");
+        install_test_qmd(&paths, &log, None);
+        fs::write(output_dir.join(".qmd-truncate-pipe"), "").unwrap();
+
+        assert!(qmd_missing_exports(&paths, std::slice::from_ref(&export))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            qmd_test_commands(&log)
+                .iter()
+                .map(|command| command.split_once('\t').unwrap().0)
+                .collect::<Vec<_>>(),
+            vec!["multi-get"]
+        );
+
+        let mut stale_body = body.into_bytes();
+        stale_body[80_000] = b'y';
+        fs::write(output_dir.join(".qmd-indexed-cursor-large.md"), stale_body).unwrap();
+        fs::write(log.with_extension("commands.log"), "").unwrap();
+        assert_eq!(
+            qmd_missing_exports(&paths, std::slice::from_ref(&export)).unwrap(),
+            vec![export]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pending_refresh_verifies_only_pending_exports() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AgentPaths::for_test(temp.path());
@@ -3200,6 +3247,8 @@ mod tests {
                     "for virtual in \"$@\"; do\n",
                     "  name=${{virtual##*/}}\n",
                     "  target={}/\"$name\"\n",
+                    "  indexed={}/.qmd-indexed-\"$name\"\n",
+                    "  [ -f \"$indexed\" ] && target=$indexed\n",
                     "  [ -f \"$target\" ] || continue\n",
                     "  printf '%s{{\"file\":\"qmd://{}/%s\",\"title\":\"test\",\"body\":\"' \"$separator\" \"$name\"\n",
                     "  sed -e 's/\\\\/\\\\\\\\/g' -e 's/\"/\\\\\"/g' -e 's/$/\\\\n/' \"$target\" | tr -d '\\n'\n",
@@ -3208,6 +3257,7 @@ mod tests {
                     "done\n",
                     "printf ']\\n'\n"
                 ),
+                shell_quote(&sessions.to_string_lossy()),
                 shell_quote(&sessions.to_string_lossy()),
                 QMD_CURSOR_COLLECTION
             )
@@ -3236,6 +3286,7 @@ mod tests {
                     "  exit 0\n",
                     "  ;;\n",
                     "multi-get)\n",
+                    "  if [ -e {}/.qmd-truncate-pipe ] && [ -p /dev/stdout ]; then printf '['; exit 0; fi\n",
                     "  {multi_get_result}",
                     "  ;;\n",
                     "*) exit 9 ;;\n",
@@ -3248,6 +3299,7 @@ mod tests {
                 pattern,
                 include,
                 pending_embeddings,
+                sessions.display(),
                 failure = failure,
                 multi_get_result = multi_get_result,
             ),
