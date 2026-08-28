@@ -1,136 +1,313 @@
 # agent-sync
 
-`agent-sync` keeps personal agent configuration aligned across Codex, Claude
-Code, and Cursor. It preserves target-owned configuration and never copies
-authentication state or raw secrets.
+`agent-sync` keeps local agent configuration aligned across Codex, Claude Code,
+and Cursor. Choose one canonical setup, preview the route, and let the managed
+sync handle drift in the background.
 
-## Use It Through Your Agent
+Target-owned configuration stays target-owned. `agent-sync` does not copy
+logins, editor settings, plugins, or native chat databases. It rejects
+recognizable secrets during portable exports. Cursor chat export is a separate,
+off-by-default option.
 
-The normal interface is natural language. Setup installs a bundled
-`agent-sync` skill in `~/.agents/skills`, where Codex and Cursor can discover
-it. If Claude Code is a configured target, the first sync also installs the
-skill in Claude's skill directory.
+## Quick Start
 
-After setup, ask your agent:
+Install the latest macOS or Linux release:
 
-- "Keep my Codex setup in sync with Cursor."
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alexanderattar/agent-sync/releases/latest/download/agent-sync-installer.sh | sh
+```
+
+The installer checks the archive's SHA-256 checksum. When a current,
+authenticated GitHub CLI is available, it also verifies signed build provenance
+from the tagged release workflow. It installs `agent-sync` in `~/.local/bin`.
+Run the same command again to upgrade. Set `AGENT_SYNC_INSTALL_DIR` to use
+another directory.
+
+The short command above trusts the installer that GitHub serves. To authenticate
+the installer before running it, use a current GitHub CLI and this copy-paste
+block:
+
+```bash
+(
+  set -eu
+  repository="alexanderattar/agent-sync"
+  version="$(gh release view --repo "$repository" --json tagName --jq .tagName)"
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
+  gh release download "$version" --repo "$repository" \
+    --pattern agent-sync-installer.sh --dir "$temp_dir"
+  gh attestation verify "$temp_dir/agent-sync-installer.sh" \
+    --repo "$repository" \
+    --signer-workflow "$repository/.github/workflows/release.yml" \
+    --source-ref "refs/tags/$version" \
+    --deny-self-hosted-runners
+  sh "$temp_dir/agent-sync-installer.sh" \
+    --version "$version" --require-attestation
+)
+```
+
+This verifies the installer and the platform archive against the same tag and
+release workflow. Run `gh auth login` first if GitHub CLI is not authenticated.
+Without an authenticated GitHub CLI, the short installer prints a warning and
+uses checksum verification only.
+
+Then open the compact terminal interface:
+
+```bash
+~/.local/bin/agent-sync
+```
+
+Use bare `agent-sync` after adding `~/.local/bin` to `PATH`. The bundled
+natural-language skill also finds the default absolute path, so your agent can
+manage the setup even when your shell has not added it yet.
+
+When a terminal is attached, the first run guides you through the source,
+targets, selected MCP servers, and optional Cursor history. Later runs show the
+managed route, drift, health, and useful actions. The UI collects your choices;
+setup and schedule changes get a review screen before they are written.
+
+All commands also work without the UI, which makes them suitable for scripts
+and agents.
+
+The managed background job currently supports macOS. Linux users get the same
+TUI, natural-language control, previews, and manual sync, but no installed
+background service yet. Linux release archives use the GNU targets and are
+built on Ubuntu 22.04 for compatibility with Ubuntu 22.04 and newer
+glibc-based systems.
+
+## Use Natural Language
+
+Saving setup installs the bundled control skill under `~/.agents/skills` for
+Codex and Cursor and under `~/.claude/skills` for Claude Code. All three agents
+can then manage the same setup through natural language.
+
+Ask your preferred agent:
+
+- "Set up agent sync for this machine."
+- "Keep my agent configuration in sync."
 - "Show me what agent-sync would change."
 - "Is agent-sync healthy?"
+- "Run agent-sync now."
+- "Turn on daily background sync."
 - "Repair my Cursor chat indexing."
 
-The skill uses the managed commands below. You do not need to remember the pack
-workflow for routine use.
+The skill translates these requests into the managed workflow. Routine use
+does not require memorized command lines.
 
-`agent-sync status` also states whether Cursor history and QMD refresh are
-enabled. The bundled skill uses that line when you ask it to repair Cursor chat
-indexing, including when history export exists but QMD refresh was disabled.
+## Safe Defaults
 
-## Set Up Once
+- CLI setup, sync, schedule installation, and schedule removal preview changes
+  by default. Their write forms require `--yes`. TUI write actions are explicit,
+  and setup and schedule changes have confirmation screens.
+- Existing target content is preserved unless you explicitly enable updates.
+- Existing Cursor-specific skills, rules, MCP entries, project configuration,
+  editor settings, plugins, and sessions are not overwritten. The optional
+  managed history hook is added or repaired without removing unrelated hooks.
+- Selected MCP definitions keep environment-variable references. Raw bearer
+  tokens, API keys, passwords, and private keys are rejected.
+- Managed replacements create backups. Changed or unowned schedule files are
+  treated as conflicts instead of being replaced or removed.
+- A target that changes after preview is preserved. The sync stops and asks for
+  a fresh preview instead of replacing the newer content.
 
-Preview the default setup:
+## Managed Workflow
+
+The default setup route is Codex to Cursor. It excludes memories, automation
+references, MCP servers, and Cursor history, and it blocks replacements.
+
+Use the UI for guided setup, or preview and save the default setup directly:
 
 ```bash
 agent-sync setup
-```
-
-The default route is Codex to Cursor. It excludes memories, automation
-references, MCP servers, and Cursor history. It also blocks replacements by
-default.
-
-Review the preview, then save the same setup:
-
-```bash
 agent-sync setup --yes
 ```
 
-Setup writes `~/.agent-sync/config.toml` and installs the bundled skill. It does
-not run the first sync.
+Setup writes `~/.agent-sync/config.toml` and installs the natural-language
+skill. It does not run the first sync. Later setup commands change only the
+options you name.
 
-After the first setup, later `setup` commands patch only the options you name.
-Unspecified source, target, MCP, history, reference, update, and health settings
-stay unchanged.
-
-To select MCP servers, name each reviewed server during both the preview and
-the saved setup:
+For example, select reviewed MCP servers or choose another supported route:
 
 ```bash
 agent-sync setup --mcp-servers qmd,exa,figma
 agent-sync setup --mcp-servers qmd,exa,figma --yes
-```
 
-No MCP servers are selected when `--mcp-servers` is absent. `--all-mcp` is
-available for an intentional full import, but review the source first.
-
-You can also choose another source or target:
-
-```bash
 agent-sync setup --from claude --to cursor
 agent-sync setup --from claude --to cursor --yes
+
+agent-sync setup --from cursor --to codex,claude
+agent-sync setup --from cursor --to codex,claude --yes
 ```
 
-## Sync
+No MCP server is selected by default. `--all-mcp` intentionally selects every
+source server and should be used only after review.
 
-Preview the current plan:
+Preview a sync, then apply and verify the same plan:
 
 ```bash
 agent-sync sync
-```
-
-The preview does not change agent configuration or replace a failed applied-run
-record. Apply and verify the plan with:
-
-```bash
 agent-sync sync --yes
 ```
 
-Each applied sync exports a private temporary pack, checks the plan, maintains
-the bundled natural-language skill, sweeps missed Cursor transcripts when
-history is enabled, applies allowed changes, verifies the result, checks for
-remaining drift, and removes the temporary pack.
+An applied sync exports a private temporary pack, validates it, applies allowed
+changes, verifies the result, records the run, and removes the pack. When
+Cursor history is enabled, it also maintains the history hook and catches
+missed transcript exports.
 
-Updates that replace target content stay blocked unless setup explicitly uses
-`--allow-updates`. Cursor-owned resources remain preserved even when updates
-are allowed.
+## Status and Maintenance
 
-## Check Status
-
-Use the short status view for routine checks:
+Use the UI for the routine view or request text or JSON explicitly:
 
 ```bash
+agent-sync
 agent-sync status
+agent-sync status --format json
 ```
 
-It shows the managed route, current drift, last successful sync, health, and the
-next action.
+Status includes the route, history mode, current drift, last successful sync,
+health, and the next action. JSON output provides the same managed status for
+scripts and other tools.
 
-Use the detailed diagnostic view when status needs attention:
+Use the detailed read-only diagnostic when status needs attention:
 
 ```bash
 agent-sync doctor
 ```
 
-Doctor checks the config, source and target paths, MCP policy, bundled skill,
-Cursor history hook, QMD refresh and pending-export state, current drift, run
-ledger consistency, and the last applied attempt and success. It does not repair
-files. It exits nonzero when any required check fails.
+Doctor checks configuration, source and target paths, MCP policy, the bundled
+skill, Cursor history, QMD coverage, current drift, and the run ledger. It exits
+nonzero when a required check fails. Unrelated QMD embedding work appears as a
+warning; missing or pending `agent-sync` exports still require attention.
 
-## Schedule It
+## Background Sync on macOS
 
-After a manual setup and successful sync, configure your scheduler to run this
-one command:
+After one successful manual sync, preview and install the managed daily
+LaunchAgent:
 
 ```bash
-agent-sync sync --yes --automation
+agent-sync schedule status
+agent-sync schedule install
+agent-sync schedule install --yes
 ```
 
-Use a stable installed binary. If the scheduler has a limited `PATH`, use the
-absolute binary path.
+The job uses the installed binary's absolute path and runs `sync --yes
+--automation` every 24 hours. It pins the effective agent and config paths from
+setup, so custom locations keep working in the background. Logs are stored
+under `~/.agent-sync/logs`.
 
-The command is the job payload. It does not create a schedule by itself.
+Preview removal before applying it:
 
-Automation mode prints `DONT_NOTIFY` only when an applied run is healthy, has
-no additions or updates, and finds no newly preserved conflict. Changes,
-failures, and new conflicts produce a short report instead.
+```bash
+agent-sync schedule uninstall
+agent-sync schedule uninstall --yes
+```
+
+The schedule owns only its managed LaunchAgent. It refuses to replace or remove
+an unowned or locally modified file.
+
+## Upgrade or Uninstall
+
+Rerun either Quick Start method to replace the binary with the latest release.
+The managed schedule uses the same stable binary path, so it does not need to
+be recreated after a normal upgrade.
+
+On macOS, disable any managed background job before removing the binary:
+
+```bash
+agent-sync schedule uninstall
+agent-sync schedule uninstall --yes
+```
+
+Then remove the binary:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alexanderattar/agent-sync/releases/latest/download/agent-sync-installer.sh | sh -s -- --uninstall
+```
+
+The installer removes only the binary. It preserves `~/.agent-sync`, synced
+agent files, backups, and logs.
+
+## Cursor History and QMD
+
+Cursor chats are not indexed automatically unless you enable history export:
+
+```bash
+agent-sync setup --refresh-qmd
+agent-sync setup --refresh-qmd --yes
+agent-sync sync --yes
+```
+
+This is an explicit privacy choice. The applied sync installs or repairs one
+managed Cursor `stop` hook. The hook copies user and assistant text into the
+private `~/.agent-sync/history/cursor` directory, redacts recognizable secrets,
+and queues a short background QMD refresh. The files use owner-only permissions
+and are indexed in the dedicated `qmd://agent-sync-cursor/` collection.
+
+Scheduled syncs catch transcripts missed by the hook. To keep private Markdown
+copies without indexing them, use `--cursor-history` instead of
+`--refresh-qmd`.
+
+The hook preserves unrelated hooks. It does not modify Cursor's chat database
+or export tool calls. The Markdown copies are portable search history, but they
+do not replace Cursor's native history, `@Chats`, resume, fork, or sharing
+features. Secret redaction is a safety layer, not a guarantee. Treat the export
+directory as sensitive and enable this option only when you want searchable
+chat copies. QMD also stores indexed text in its own local database, which has
+QMD's permissions and retention behavior.
+
+This covers local Cursor sessions that provide a transcript. Cursor cloud
+agents do not load user-level `~/.cursor/hooks.json`, so cloud-only chats are
+not exported by this workflow.
+
+## What It Manages
+
+`agent-sync` understands:
+
+- Codex, Claude Code, Cursor, and shared personal skills.
+- Codex guidance can be bridged additively into Claude Code and Cursor.
+- Claude Code and Cursor-specific rules stay owned by their respective agent
+  when their semantics do not map safely.
+- Selected MCP definitions from the canonical source, applied additively to
+  supported targets.
+- Optional Codex memory and automation references in advanced packs.
+- Optional Cursor transcript exports and QMD refresh.
+
+Codex, Claude Code, or Cursor can be the canonical source. Any other supported
+agent can be a target. Personal files are local to the machine; remote agents
+and teammates need their own installation or approved repository-level skills.
+
+MCP exports keep supported environment-variable references instead of secret
+values. For example:
+
+```toml
+[mcp_servers.example.env_http_headers]
+Authorization = "EXAMPLE_MCP_AUTHORIZATION"
+```
+
+becomes this in Claude Code:
+
+```json
+{
+  "headers": {
+    "Authorization": "${EXAMPLE_MCP_AUTHORIZATION}"
+  }
+}
+```
+
+and this in Cursor:
+
+```json
+{
+  "headers": {
+    "Authorization": "${env:EXAMPLE_MCP_AUTHORIZATION}"
+  }
+}
+```
+
+Each user must provide the referenced environment variable on their own
+machine. Agent-specific connection and tool timeouts stay local. If a selected
+MCP definition uses another option that cannot be represented safely in the
+target agent, agent-sync stops and names that option instead of dropping it.
 
 ## Durable State
 
@@ -142,109 +319,33 @@ Managed configuration and run history live under `~/.agent-sync`:
 ~/.agent-sync/state/last-success.json
 ~/.agent-sync/state/runs.jsonl
 ~/.agent-sync/state/bundled-skill.json
+~/.agent-sync/state/bundled-skill-claude.json
+~/.agent-sync/state/cursor-mcp.json
 ~/.agent-sync/state/qmd-refresh-state.json
 ~/.agent-sync/state/qmd-pending/
+~/.agent-sync/history/cursor/
 ~/.agent-sync/backups/<timestamp>/
+~/.agent-sync/logs/
 ```
 
-`last-attempt.json` records applied successes and failures. A preview never
-clears a failed attempt.
-`last-success.json` changes only after an applied run passes verification.
-`runs.jsonl` keeps the applied-run history. Backups are created before managed
-files are replaced.
+Previews do not alter run state. `last-success.json` changes only after an
+applied run passes verification.
 
-## Cursor Safety
+Only recorded, still-unmodified agent-sync MCP entries receive managed updates.
+User and unknown Cursor entries remain preserved.
 
-Cursor sync is additive and preserves Cursor as the owner of its existing
-configuration:
+## Recovery
 
-- Cursor reads Codex, Claude, and shared `.agents` skills from their live
-  directories.
-- A differing skill already under `~/.cursor/skills` is preserved.
-- Codex guidance uses `~/.cursor/rules/imported-codex-agents.mdc` as a bridge to
-  the live `~/.codex/AGENTS.md` file.
-- A differing existing Cursor rule is preserved.
-- Existing same-name Cursor MCP entries remain unchanged.
-- MCP servers supplied by a Cursor project or plugin are preserved.
-- Missing selected MCP entries are added without changing unrelated JSON
-  fields or file permissions.
-- A symlinked Cursor MCP file is refused.
-- Cursor settings, plugins, chat databases, editor state, and authentication
-  sessions are not copied.
+Ask any configured agent, "Help me recover the last agent-sync change." It
+should start with `status` and `doctor`, inspect the recorded run and its backup
+directory, and show the exact recovery plan before changing files.
 
-## Cursor History And QMD
+`agent-sync` does not blindly restore a whole backup tree. A later agent run or
+manual edit may own those paths now, so recovery stays reviewable and
+path-specific. Failed schedule updates roll back automatically, and normal sync
+repairs remain subject to the same preview, ownership, and verification checks.
 
-Enable searchable Cursor history during setup:
-
-```bash
-agent-sync setup --cursor-history
-agent-sync setup --cursor-history --yes
-agent-sync sync --yes
-```
-
-The applied sync installs or repairs one managed Cursor `stop` hook. The hook
-exports user and assistant text to `~/Documents/Obsidian/sessions` and refreshes
-the QMD index and embeddings after a completed agent run. Each applied sync also
-sweeps Cursor's transcript directory before one QMD refresh, so the scheduled
-job catches chats missed by the hook. It preserves unrelated hooks and does not
-modify Cursor's chat database or export tool calls.
-
-`agent-sync doctor` checks that the hook points to the current executable, the
-QMD `sessions` collection includes Cursor Markdown, every local transcript has
-a current export, the exports are retrievable from QMD, no embeddings are
-pending, and a successful QMD refresh is recorded.
-
-The Markdown copies are portable search history. They do not replace Cursor's
-native chat history, `@Chats`, resume, fork, or shared-transcript features, and
-they cannot resume a native Cursor conversation.
-
-## What It Can Manage
-
-`agent-sync` understands:
-
-- Codex skills from `~/.codex/skills`.
-- Claude skills from `~/.claude/skills`.
-- Shared skills from `~/.agents/skills`.
-- Codex guidance from `~/.codex/AGENTS.md`.
-- Claude guidance from `~/.claude/CLAUDE.md`.
-- MCP definitions from Codex, Claude, and Cursor.
-- Optional Codex memory and automation references in advanced packs.
-- Cursor user skills, rules, MCP names, and optional transcript exports.
-
-It does not copy bearer tokens, API keys, passwords, private keys, hosted
-connector sessions, browser sessions, plugin installation state, or team
-authentication state.
-
-This setup installs personal skills under `~/.agents/skills`, which local Cursor
-and Codex sessions can discover. For Cloud Agents, remote machines, or a team
-workflow, place the approved skills in the repository or install agent-sync on
-that environment. Personal files on one Mac are not automatically present on
-another worker.
-
-MCP exports keep supported environment variable references instead of secret
-values. For example:
-
-```toml
-[mcp_servers.example.env_http_headers]
-Authorization = "EXAMPLE_MCP_AUTHORIZATION"
-```
-
-becomes:
-
-```json
-{
-  "headers": {
-    "Authorization": "${EXAMPLE_MCP_AUTHORIZATION}"
-  }
-}
-```
-
-Each user must provide the referenced environment variable on their own
-machine.
-
-## Install
-
-Build with Rust and Cargo:
+## Build from Source
 
 ```bash
 cargo build --release
@@ -252,6 +353,43 @@ cargo build --release
 
 The binary is written to `target/release/agent-sync`. Place it at a stable path
 on your `PATH` before setup or scheduling.
+
+## Release Integrity
+
+The release workflow pins each GitHub Action to a full commit SHA. It publishes
+a GitHub artifact attestation for the installer and each platform archive.
+Consumers can verify the signer workflow, source tag, and use of GitHub-hosted
+runners with `gh attestation verify`, as shown in Quick Start.
+
+Before the first public tag, enable [GitHub release
+immutability](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes).
+This locks each published tag and its assets and adds GitHub's release
+attestation. Build attestations prove which workflow produced an artifact. They
+do not make a build reproducible or remove trust in repository maintainers,
+GitHub-hosted runners, the Rust toolchain, or locked dependencies.
+
+## Roll It Out to a Team
+
+Publish a tagged release, then share the Quick Start command. Each teammate
+runs `agent-sync`, chooses a source and targets, reviews the first sync, and can
+enable daily maintenance on macOS. From then on, they can ask Codex, Claude
+Code, or Cursor to check health, preview drift, sync, or repair the setup.
+
+Keep personal authentication and local choices on each machine. Put shared team
+instructions in version-controlled repository skills or rules. Use a reviewed,
+new portable pack only when you need an explicit configuration handoff; do not
+share a personal pack by default.
+
+The same binary and bundled skill work with each supported local agent. Plugin
+installations and account connections remain native to each agent;
+`agent-sync` does not try to copy their credentials or sessions.
+
+For a predictable rollout, pin `AGENT_SYNC_VERSION` in your internal setup
+guide and test upgrades on one machine before changing the team pin. The public
+installer verifies the release checksum and also verifies GitHub build
+provenance when an authenticated, current GitHub CLI is available. Pass
+`--require-attestation` when archive provenance must be mandatory. Use the
+verified Quick Start block when the installer itself must also be authenticated.
 
 ## Advanced: Pack Commands
 
@@ -261,7 +399,7 @@ commands for inspection, migration, or a curated shared pack.
 The terms are:
 
 - **Source**: the agent configuration to export. Values are `codex`, `claude`,
-  or `all`.
+  `cursor`, or `all`.
 - **Pack**: a local directory with exported resources and a manifest.
 - **Target**: the agent configuration to inspect or update. Values are `codex`,
   `claude`, `cursor`, or a comma-separated combination.
@@ -310,7 +448,8 @@ agent-sync export \
 ```
 
 `--portable-only` excludes memory and automation references. It refuses a
-reused pack whose `references` directory is not empty.
+reused or non-empty pack. Start each export with a new pack directory so stale
+content cannot leak into the result.
 
 A pack can contain private paths and context. Inspect it before sharing. Prefer
 a curated pack that excludes memories, customer context, local-only rules, and
@@ -397,7 +536,11 @@ cargo build --release
 The integration tests use temporary agent homes. They do not use the machine's
 real Codex, Claude, or Cursor directories.
 
-## Publishing
+## Sharing Packs
 
-The tool can be public, but a raw personal pack may contain private context.
-Review any shared pack like other public configuration.
+A raw personal pack can contain private paths and context. Review it like any
+other public configuration before you publish or send it.
+
+## License
+
+MIT

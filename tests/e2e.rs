@@ -132,6 +132,20 @@ fn write(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
 }
 
+fn assert_managed_cursor_rule_marker(content: &str) {
+    let frontmatter = "---\ndescription: Imported Codex agent guidance\nalwaysApply: true\n---\n";
+    let marked_body = content
+        .strip_prefix(frontmatter)
+        .expect("managed Cursor rule frontmatter");
+    let (marker, body) = marked_body.split_once('\n').expect("managed marker line");
+    let expected = marker
+        .strip_prefix("<!-- agent-sync-managed: cursor-codex-agents body-sha256=")
+        .and_then(|value| value.strip_suffix(" -->"))
+        .expect("managed marker hash");
+    let actual = format!("{:x}", Sha256::digest(body.as_bytes()));
+    assert_eq!(actual, expected, "{content}");
+}
+
 #[test]
 fn exports_applies_and_verifies_codex_pack_to_claude() {
     let temp = setup_fixture();
@@ -236,6 +250,46 @@ fn exports_applies_and_verifies_codex_pack_to_claude() {
 }
 
 #[test]
+fn claude_source_prefers_claude_owned_skill_over_shared_duplicate() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("claude-source-pack");
+    write(
+        &root.join(".agents/skills/foo/SKILL.md"),
+        "---\nname: foo\ndescription: Shared copy\n---\n\n# Shared foo\n",
+    );
+    write(
+        &root.join(".claude/skills/foo/SKILL.md"),
+        "---\nname: foo\ndescription: Claude copy\n---\n\n# Claude foo\n",
+    );
+
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "claude",
+        ],
+    );
+
+    let exported = fs::read_to_string(pack.join("skills/foo/SKILL.md")).unwrap();
+    assert!(exported.contains("# Claude foo"));
+    assert!(!exported.contains("# Shared foo"));
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("agent-sync.manifest.json")).unwrap())
+            .unwrap();
+    let foo = manifest["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["name"] == "foo")
+        .unwrap();
+    assert_eq!(foo["source_agent"], "claude");
+}
+
+#[test]
 fn discover_reports_codex_claude_and_shared_agent_sources() {
     let temp = setup_fixture();
     let root = temp.path();
@@ -252,6 +306,42 @@ fn discover_reports_codex_claude_and_shared_agent_sources() {
     assert!(output.contains("Cursor"));
     assert!(output.contains("Shared .agents"));
     assert!(output.contains("shared-style"));
+}
+
+#[test]
+fn cursor_reuses_supported_codex_and_shared_skill_locations() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("cursor-compatible-skills");
+
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+    let dry_run = run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+
+    assert!(dry_run.contains("Unchanged cursor Skill:pr-review"));
+    assert!(dry_run.contains(root.join(".codex/skills/pr-review").to_str().unwrap()));
+    assert!(dry_run.contains("Unchanged cursor Skill:shared-style"));
+    assert!(dry_run.contains(root.join(".agents/skills/shared-style").to_str().unwrap()));
+    assert!(!root.join(".cursor/skills/pr-review").exists());
+    assert!(!root.join(".cursor/skills/shared-style").exists());
 }
 
 #[test]
@@ -437,7 +527,268 @@ fn applies_pack_to_cursor_additively_and_preserves_cursor_state() {
 }
 
 #[test]
-fn cursor_rule_references_live_codex_guidance_without_copying_it() {
+fn managed_cursor_mcp_entry_updates_from_recorded_state() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let initial_pack = root.join("cursor-mcp-initial-pack");
+    let updated_pack = root.join("cursor-mcp-updated-pack");
+
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            initial_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            initial_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+    assert!(root.join(".agent-sync/state/cursor-mcp.json").exists());
+
+    write(
+        &root.join(".codex/config.toml"),
+        "[mcp_servers.qmd]\ncommand = \"/opt/qmd-v2\"\nargs = [\"mcp\", \"--new\"]\n",
+    );
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+    let preview = run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(
+        preview.contains("ManagedUpdate cursor Mcp:qmd"),
+        "{preview}"
+    );
+
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+    let cursor: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".cursor/mcp.json")).unwrap()).unwrap();
+    assert_eq!(cursor["mcpServers"]["qmd"]["command"], "/opt/qmd-v2");
+    assert_eq!(
+        cursor["mcpServers"]["qmd"]["args"],
+        serde_json::json!(["mcp", "--new"])
+    );
+}
+
+#[test]
+fn cursor_mcp_user_edit_is_preserved_after_source_changes() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let initial_pack = root.join("cursor-mcp-owned-pack");
+    let updated_pack = root.join("cursor-mcp-user-edit-pack");
+
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            initial_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            initial_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+
+    let cursor_path = root.join(".cursor/mcp.json");
+    let mut cursor: Value =
+        serde_json::from_str(&fs::read_to_string(&cursor_path).unwrap()).unwrap();
+    cursor["mcpServers"]["qmd"]["cursorOnlyField"] = serde_json::json!(true);
+    write(
+        &cursor_path,
+        &format!("{}\n", serde_json::to_string_pretty(&cursor).unwrap()),
+    );
+    let user_value = cursor["mcpServers"]["qmd"].clone();
+
+    write(
+        &root.join(".codex/config.toml"),
+        "[mcp_servers.qmd]\ncommand = \"/opt/qmd-v2\"\nargs = [\"mcp\"]\n",
+    );
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+    let preview = run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(preview.contains("Skip cursor Mcp:qmd"), "{preview}");
+
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+    let preserved: Value = serde_json::from_str(&fs::read_to_string(cursor_path).unwrap()).unwrap();
+    assert_eq!(preserved["mcpServers"]["qmd"], user_value);
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_mcp_state_write_failure_rolls_back_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = setup_fixture();
+    let root = temp.path();
+    let initial_pack = root.join("cursor-mcp-rollback-initial-pack");
+    let updated_pack = root.join("cursor-mcp-rollback-updated-pack");
+
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            initial_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+    run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            initial_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+    write(
+        &root.join(".codex/config.toml"),
+        "[mcp_servers.qmd]\ncommand = \"/opt/qmd-v2\"\nargs = [\"mcp\"]\n",
+    );
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+    let preview = run(
+        root,
+        &[
+            "apply",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(preview.contains("ManagedUpdate cursor Mcp:qmd"));
+
+    let cursor_path = root.join(".cursor/mcp.json");
+    let cursor_before = fs::read(&cursor_path).unwrap();
+    let state_dir = root.join(".agent-sync/state");
+    let original_permissions = fs::metadata(&state_dir).unwrap().permissions();
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let output = run_output(
+        root,
+        &[
+            "apply",
+            "--pack",
+            updated_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    );
+    fs::set_permissions(&state_dir, original_permissions).unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Cursor MCP ownership state"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(cursor_path).unwrap(), cursor_before);
+}
+
+#[test]
+fn cursor_rule_embeds_codex_guidance_and_preserves_cursor_precedence() {
     let temp = setup_fixture();
     let root = temp.path();
     let pack = root.join("cursor-rule-pack");
@@ -473,9 +824,123 @@ fn cursor_rule_references_live_codex_guidance_without_copying_it() {
 
     let imported =
         fs::read_to_string(root.join(".cursor/rules/imported-codex-agents.mdc")).unwrap();
-    assert!(imported.contains("~/.codex/AGENTS.md"));
     assert!(imported.contains("Cursor-specific settings and rules take precedence"));
-    assert!(!imported.contains("credential-bearing-sentinel"));
+    assert!(imported.contains("credential-bearing-sentinel"));
+}
+
+#[test]
+fn managed_cursor_rule_updates_until_a_user_edits_it() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let rule = root.join(".cursor/rules/imported-codex-agents.mdc");
+
+    run(root, &["setup", "--yes"]);
+    run(root, &["sync", "--yes"]);
+    let initial = fs::read_to_string(&rule).unwrap();
+    assert!(initial.contains("agent-sync-managed: cursor-codex-agents body-sha256="));
+    assert_managed_cursor_rule_marker(&initial);
+    assert!(initial.contains("Keep changes scoped."));
+
+    write(
+        &root.join(".codex/AGENTS.md"),
+        "# Global Agent Rules\n\n- Keep changes scoped.\n- Use focused tests.\n",
+    );
+    let update_pack = root.join("managed-rule-update-pack");
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            update_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+    let direct_diff = run_output(
+        root,
+        &[
+            "diff",
+            "--pack",
+            update_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(direct_diff.status.success());
+    assert!(
+        String::from_utf8_lossy(&direct_diff.stdout)
+            .contains("ManagedUpdate cursor Rule:codex-agents"),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&direct_diff.stdout),
+        String::from_utf8_lossy(&direct_diff.stderr)
+    );
+    let update_preview = run(root, &["sync"]);
+    assert!(
+        update_preview.contains("ManagedUpdate cursor Rule:codex-agents"),
+        "{update_preview}"
+    );
+
+    run(root, &["sync", "--yes"]);
+    let updated = fs::read_to_string(&rule).unwrap();
+    assert_ne!(updated, initial);
+    assert!(updated.contains("Use focused tests."));
+
+    let manually_edited = format!("{updated}\nCursor-owned addition.\n");
+    write(&rule, &manually_edited);
+    let preserve_diff = run(
+        root,
+        &[
+            "diff",
+            "--pack",
+            update_pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+    );
+    assert!(
+        preserve_diff.contains("Skip cursor Rule:codex-agents"),
+        "{preserve_diff}"
+    );
+    let preserve_preview = run(root, &["sync"]);
+    assert!(
+        preserve_preview.contains("Preserved target-owned resources:"),
+        "{preserve_preview}"
+    );
+
+    run(root, &["sync", "--yes"]);
+    assert_eq!(fs::read_to_string(rule).unwrap(), manually_edited);
+}
+
+#[test]
+fn exact_legacy_cursor_rule_upgrades_but_an_edited_copy_is_preserved() {
+    const LEGACY_RULE: &str = "---\ndescription: Bridge to Codex global agent rules\nalwaysApply: true\n---\n# Codex Agent Rule Bridge\n\nBefore starting a task, read and follow `~/.codex/AGENTS.md` when it exists. Treat it as shared guidance. Direct user instructions and Cursor-specific settings and rules take precedence if they conflict with that file.\n\nWhen prior work may matter, search the QMD `sessions` collection. QMD history is searchable context, not a resumable Cursor chat.\n";
+
+    let temp = setup_fixture();
+    let root = temp.path();
+    let rule = root.join(".cursor/rules/imported-codex-agents.mdc");
+    run(root, &["setup", "--yes"]);
+
+    write(&rule, LEGACY_RULE);
+    let upgrade_preview = run(root, &["sync"]);
+    assert!(
+        upgrade_preview.contains("ManagedUpdate cursor Rule:codex-agents"),
+        "{upgrade_preview}"
+    );
+    run(root, &["sync", "--yes"]);
+    let upgraded = fs::read_to_string(&rule).unwrap();
+    assert!(upgraded.contains("agent-sync-managed: cursor-codex-agents body-sha256="));
+    assert!(upgraded.contains("Keep changes scoped."));
+
+    let edited_legacy = format!("{LEGACY_RULE}Cursor-owned addition.\n");
+    write(&rule, &edited_legacy);
+    let preserve_preview = run(root, &["sync"]);
+    assert!(
+        preserve_preview.contains("Preserved target-owned resources:"),
+        "{preserve_preview}"
+    );
+    run(root, &["sync", "--yes"]);
+    assert_eq!(fs::read_to_string(rule).unwrap(), edited_legacy);
 }
 
 #[test]
@@ -765,7 +1230,7 @@ fn portable_only_refuses_a_reused_pack_with_references() {
             "--portable-only",
         ],
     );
-    assert!(error.contains("--portable-only refuses reused pack"));
+    assert!(error.contains("export requires an empty pack"));
     assert!(pack.join("references/codex-memories/MEMORY.md").exists());
     assert_eq!(
         fs::read(pack.join("agent-sync.manifest.json")).unwrap(),
@@ -831,7 +1296,7 @@ description: Symlinked shared skill
 }
 
 #[test]
-fn raw_mcp_headers_are_not_exported() {
+fn raw_mcp_headers_block_export() {
     let temp = setup_fixture();
     let root = temp.path();
     write(
@@ -858,7 +1323,7 @@ fn raw_mcp_headers_are_not_exported() {
     );
     let pack = root.join("pack");
 
-    run(
+    let error = run_failure(
         root,
         &[
             "export",
@@ -869,9 +1334,9 @@ fn raw_mcp_headers_are_not_exported() {
         ],
     );
 
-    let exported = fs::read_to_string(pack.join("mcp/servers.json")).unwrap();
-    assert!(!exported.contains("literal-value-that-should-not-export"));
-    assert!(exported.contains("SAFE_AUTH_ENV"));
+    assert!(error.contains("MCP server `unsafe`"), "{error}");
+    assert!(error.contains("unsupported value"), "{error}");
+    assert!(!pack.join("mcp/servers.json").exists());
 }
 
 #[test]
@@ -879,6 +1344,15 @@ fn export_can_limit_mcp_servers_to_a_reviewed_allowlist() {
     let temp = setup_fixture();
     let root = temp.path();
     let pack = root.join("allowlisted-pack");
+    let mut codex_config = fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    codex_config.push_str(
+        r#"
+[mcp_servers.unselected_secret]
+command = "/usr/local/bin/unselected"
+args = ["--api-key", "literal-secret-that-must-not-export"]
+"#,
+    );
+    write(&root.join(".codex/config.toml"), &codex_config);
 
     run(
         root,
@@ -897,6 +1371,10 @@ fn export_can_limit_mcp_servers_to_a_reviewed_allowlist() {
         serde_json::from_str(&fs::read_to_string(pack.join("mcp/servers.json")).unwrap()).unwrap();
     assert!(exported.get("qmd").is_some());
     assert!(exported.get("example_http").is_none());
+    assert!(exported.get("unselected_secret").is_none());
+    assert!(!fs::read_to_string(pack.join("mcp/servers.json"))
+        .unwrap()
+        .contains("literal-secret-that-must-not-export"));
 
     let manifest: Value =
         serde_json::from_str(&fs::read_to_string(pack.join("agent-sync.manifest.json")).unwrap())
@@ -909,6 +1387,320 @@ fn export_can_limit_mcp_servers_to_a_reviewed_allowlist() {
         .filter_map(|resource| resource["name"].as_str())
         .collect::<Vec<_>>();
     assert_eq!(mcp_names, vec!["qmd"]);
+}
+
+#[test]
+fn unlisted_mcp_server_is_rejected_before_diff_verify_or_apply() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let pack = root.join("unlisted-mcp-pack");
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+
+    let mcp_path = pack.join("mcp/servers.json");
+    let mut servers: Value = serde_json::from_str(&fs::read_to_string(&mcp_path).unwrap()).unwrap();
+    let hidden = servers["qmd"].clone();
+    servers
+        .as_object_mut()
+        .unwrap()
+        .insert("hidden".to_string(), hidden);
+    let mcp_raw = [serde_json::to_vec_pretty(&servers).unwrap(), b"\n".to_vec()].concat();
+    fs::write(&mcp_path, &mcp_raw).unwrap();
+
+    let manifest_path = pack.join("agent-sync.manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let mcp_hash = format!("{:x}", Sha256::digest(&mcp_raw));
+    for resource in manifest["resources"].as_array_mut().unwrap() {
+        if resource["kind"] == "mcp" {
+            resource["sha256"] = Value::String(mcp_hash.clone());
+        }
+    }
+    fs::write(
+        &manifest_path,
+        [
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+            b"\n".to_vec(),
+        ]
+        .concat(),
+    )
+    .unwrap();
+
+    let cursor_before = fs::read(root.join(".cursor/mcp.json")).unwrap();
+    for arguments in [
+        vec![
+            "diff",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+        vec![
+            "verify",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+        ],
+        vec![
+            "apply",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--targets",
+            "cursor",
+            "--yes",
+        ],
+    ] {
+        let error = run_failure(root, &arguments);
+        assert!(error.contains("MCP authorization mismatch"), "{error}");
+        assert!(error.contains("unlisted server(s): hidden"), "{error}");
+    }
+    assert_eq!(
+        fs::read(root.join(".cursor/mcp.json")).unwrap(),
+        cursor_before
+    );
+}
+
+#[test]
+fn raw_mcp_credentials_in_args_urls_env_and_helpers_block_export() {
+    let codex_cases = [
+        (
+            "args",
+            r#"[mcp_servers.unsafe]
+command = "/usr/local/bin/unsafe"
+args = ["--api-key", "literal-secret-value"]
+"#,
+            "argument",
+        ),
+        (
+            "url",
+            r#"[mcp_servers.unsafe]
+url = "https://user:literal-password@example.invalid/mcp"
+"#,
+            "URL",
+        ),
+        (
+            "env",
+            r#"[mcp_servers.unsafe]
+command = "/usr/local/bin/unsafe"
+
+[mcp_servers.unsafe.env]
+SERVICE_PASSWORD = "literal-secret-value"
+"#,
+            "SERVICE_PASSWORD",
+        ),
+        (
+            "inline-env",
+            r#"[mcp_servers.unsafe]
+command = "/usr/local/bin/unsafe"
+env = { apiKey = "literal-secret-value" }
+"#,
+            "apiKey",
+        ),
+    ];
+    for (case, config, expected) in codex_cases {
+        let temp = setup_fixture();
+        let root = temp.path();
+        write(&root.join(".codex/config.toml"), config);
+        let pack = root.join(format!("unsafe-{case}-pack"));
+
+        let error = run_failure(
+            root,
+            &[
+                "export",
+                "--pack",
+                pack.to_str().unwrap(),
+                "--from",
+                "codex",
+                "--portable-only",
+            ],
+        );
+
+        assert!(error.contains("MCP server `unsafe`"), "{case}: {error}");
+        assert!(error.contains(expected), "{case}: {error}");
+        assert!(!pack.join("mcp/servers.json").exists());
+    }
+
+    let temp = setup_fixture();
+    let root = temp.path();
+    write(
+        &root.join(".claude.json"),
+        r#"{
+  "mcpServers": {
+    "unsafe": {
+      "type": "http",
+      "url": "https://example.invalid/mcp",
+      "headersHelper": "/usr/local/bin/header-helper --token literal-secret-value"
+    }
+  }
+}
+"#,
+    );
+    let pack = root.join("unsafe-helper-pack");
+    let error = run_failure(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "claude",
+            "--portable-only",
+        ],
+    );
+    assert!(error.contains("MCP server `unsafe`"), "{error}");
+    assert!(error.contains("headersHelper"), "{error}");
+    assert!(!pack.join("mcp/servers.json").exists());
+}
+
+#[test]
+fn sensitive_files_and_raw_credentials_in_exported_trees_block_export() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    write(
+        &root.join(".codex/skills/leaky/.env"),
+        "SERVICE_TOKEN=literal-secret-value\n",
+    );
+    write(
+        &root.join(".codex/skills/leaky/SKILL.md"),
+        "---\nname: leaky\ndescription: Leaky fixture\n---\n",
+    );
+    let pack = root.join("sensitive-skill-pack");
+
+    let error = run_failure(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+    assert!(error.contains("skill `leaky`"), "{error}");
+    assert!(error.contains(".env"), "{error}");
+    assert!(!pack.join("skills/leaky/.env").exists());
+
+    let temp = setup_fixture();
+    let root = temp.path();
+    write(
+        &root.join(".codex/memories/reference/config.json"),
+        "{\"apiKey\": \"literal-secret-value\"}\n",
+    );
+    let pack = root.join("sensitive-reference-pack");
+    let error = run_failure(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+        ],
+    );
+    assert!(error.contains("Codex memory references"), "{error}");
+    assert!(error.contains("config.json"), "{error}");
+    assert!(!pack
+        .join("references/codex-memories/reference/config.json")
+        .exists());
+}
+
+#[test]
+fn export_scanner_handles_source_types_passphrases_tokens_and_binary_credentials() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    write(
+        &root.join(".codex/skills/typed/SKILL.md"),
+        "---\nname: typed\ndescription: Typed fixture\n---\n```rust\nstruct Config {\n    token: Option<String>,\n}\n```\nToken: authentication token used by the service.\n",
+    );
+    let safe_pack = root.join("typed-pack");
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            safe_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+    assert!(safe_pack.join("skills/typed/SKILL.md").is_file());
+
+    for (name, content) in [
+        ("passphrase", "password: correct horse battery staple\n"),
+        (
+            "bare-env-shape",
+            "API_TOKEN=PRODUCTION_SECRET_VALUE_12345\n",
+        ),
+        ("github-token", "ghp_12345678901234567890\n"),
+    ] {
+        let temp = setup_fixture();
+        let root = temp.path();
+        write(
+            &root.join(format!(".codex/skills/{name}/SKILL.md")),
+            &format!("---\nname: {name}\ndescription: Scanner fixture\n---\n{content}"),
+        );
+        let pack = root.join(format!("{name}-pack"));
+
+        let error = run_failure(
+            root,
+            &[
+                "export",
+                "--pack",
+                pack.to_str().unwrap(),
+                "--from",
+                "codex",
+                "--portable-only",
+            ],
+        );
+
+        assert!(
+            error.contains("refusing to export skill"),
+            "{name}: {error}"
+        );
+        assert!(!pack.join(format!("skills/{name}/SKILL.md")).exists());
+    }
+
+    let temp = setup_fixture();
+    let root = temp.path();
+    write(
+        &root.join(".codex/skills/binary/SKILL.md"),
+        "---\nname: binary\ndescription: Binary fixture\n---\n",
+    );
+    fs::write(
+        root.join(".codex/skills/binary/credential-store.bin"),
+        [0xff, 0x00, 0x01],
+    )
+    .unwrap();
+    let pack = root.join("binary-pack");
+
+    let error = run_failure(
+        root,
+        &[
+            "export",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+        ],
+    );
+
+    assert!(error.contains("binary credential container"), "{error}");
+    assert!(!pack.join("skills/binary/credential-store.bin").exists());
 }
 
 #[test]
@@ -1312,14 +2104,14 @@ fn setup_patches_existing_policy_instead_of_resetting_unspecified_fields() {
     );
     let preview = run(root, &["setup", "--cursor-history"]);
     assert!(preview.contains("MCP: selected (qmd)"));
-    assert!(preview.contains("Cursor history: enabled with QMD refresh"));
+    assert!(preview.contains("Cursor history: enabled without QMD refresh"));
     run(root, &["setup", "--cursor-history", "--yes"]);
 
     let config = fs::read_to_string(root.join(".agent-sync/config.toml")).unwrap();
     assert!(config.contains("mode = \"selected\""));
     assert!(config.contains("servers = [\"qmd\"]"));
     assert!(config.contains("enabled = true"));
-    assert!(config.contains("refresh_qmd = true"));
+    assert!(config.contains("refresh_qmd = false"));
 }
 
 #[test]
@@ -1337,10 +2129,9 @@ fn managed_sync_removes_only_its_history_hook_when_history_is_disabled() {
         serde_json::from_str(&fs::read_to_string(root.join(".cursor/hooks.json")).unwrap())
             .unwrap();
     assert_eq!(installed["hooks"]["stop"][0]["command"], "custom-hook");
-    assert!(installed["hooks"]["stop"][1]["command"]
-        .as_str()
-        .unwrap()
-        .ends_with("cursor-history export --skip-qmd"));
+    let managed_command = installed["hooks"]["stop"][1]["command"].as_str().unwrap();
+    assert!(managed_command.contains(" cursor-history export --output-dir "));
+    assert!(managed_command.ends_with("--skip-qmd # agent-sync-managed-hook-v1"));
 
     run(root, &["setup", "--no-cursor-history", "--yes"]);
     run(root, &["sync", "--yes"]);
@@ -1363,6 +2154,36 @@ fn status_exposes_when_cursor_history_skips_qmd() {
 
     let repair = run(root, &["setup", "--refresh-qmd"]);
     assert!(repair.contains("Cursor history: enabled with QMD refresh"));
+}
+
+#[test]
+fn malformed_cursor_transcript_does_not_block_sync_and_remains_unhealthy() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let transcript =
+        root.join(".cursor/projects/example/agent-transcripts/future-format/future-format.jsonl");
+    write(&transcript, "{\"version\":999,\"newCursorSchema\":true}\n");
+    run(root, &["setup", "--cursor-history", "--skip-qmd", "--yes"]);
+
+    let sync = run(root, &["sync", "--yes"]);
+    assert!(sync.contains("Skipped 1 unreadable Cursor transcript"));
+    assert!(root
+        .join(".cursor/rules/imported-codex-agents.mdc")
+        .exists());
+
+    let status: Value = serde_json::from_str(&run(root, &["status", "--format", "json"])).unwrap();
+    assert_eq!(status["healthy"], false);
+    assert!(status["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error
+            .as_str()
+            .is_some_and(|error| error.contains("1 unreadable transcript"))));
+
+    let doctor = run_output(root, &["doctor"]);
+    assert!(!doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("1 unreadable"));
 }
 
 #[test]
@@ -1690,4 +2511,146 @@ fn managed_sync_rejects_a_symlinked_run_history_before_target_writes() {
     assert!(!root
         .join(".cursor/rules/imported-codex-agents.mdc")
         .exists());
+}
+
+#[test]
+fn cursor_can_be_the_managed_source_without_changing_cursor_owned_settings() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    write(
+        &root.join(".cursor/skills/cursor-only/SKILL.md"),
+        "---\nname: cursor-only\ndescription: Cursor source skill\n---\n",
+    );
+    write(
+        &root.join(".cursor/rules/personal.mdc"),
+        "---\nalwaysApply: true\n---\nKeep this Cursor rule.\n",
+    );
+    write(
+        &root.join(".cursor/settings.json"),
+        "{\"cursorSpecific\":true}\n",
+    );
+    write(
+        &root.join(".cursor/mcp.json"),
+        "{\"mcpServers\":{\"cursor-tools\":{\"command\":\"cursor-tools\",\"args\":[\"serve\"]}},\"cursorOnly\":true}\n",
+    );
+    let original_mcp = fs::read_to_string(root.join(".cursor/mcp.json")).unwrap();
+    let original_rule = fs::read_to_string(root.join(".cursor/rules/personal.mdc")).unwrap();
+    let original_settings = fs::read_to_string(root.join(".cursor/settings.json")).unwrap();
+
+    run(
+        root,
+        &[
+            "setup",
+            "--from",
+            "cursor",
+            "--to",
+            "codex,claude",
+            "--mcp-servers",
+            "cursor-tools",
+            "--yes",
+        ],
+    );
+    let applied = run(root, &["sync", "--yes"]);
+
+    assert!(applied.contains("cursor-only"));
+    assert!(root.join(".codex/skills/cursor-only/SKILL.md").is_file());
+    assert!(root.join(".claude/skills/cursor-only/SKILL.md").is_file());
+    assert_eq!(
+        fs::read_to_string(root.join(".cursor/mcp.json")).unwrap(),
+        original_mcp
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".cursor/rules/personal.mdc")).unwrap(),
+        original_rule
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".cursor/settings.json")).unwrap(),
+        original_settings
+    );
+
+    let codex = fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    assert!(codex.contains("[mcp_servers.cursor-tools]"));
+    let claude: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        claude["mcpServers"]["cursor-tools"]["command"],
+        "cursor-tools"
+    );
+}
+
+#[test]
+fn setup_installs_natural_language_control_for_claude() {
+    let temp = setup_fixture();
+    let root = temp.path();
+
+    run(root, &["setup", "--yes"]);
+
+    let shared = fs::read_to_string(root.join(".agents/skills/agent-sync/SKILL.md")).unwrap();
+    let claude = fs::read_to_string(root.join(".claude/skills/agent-sync/SKILL.md")).unwrap();
+    assert_eq!(claude, shared);
+    assert!(root
+        .join(".agent-sync/state/bundled-skill-claude.json")
+        .is_file());
+}
+
+#[test]
+fn managed_status_json_has_stable_health_and_background_fields() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    run(root, &["setup", "--yes"]);
+    run(root, &["sync", "--yes"]);
+
+    let status: Value = serde_json::from_str(&run(root, &["status", "--format", "json"])).unwrap();
+
+    assert_eq!(status["source"], "codex");
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["cursor_history"], "disabled");
+    assert_eq!(status["healthy"], true);
+    assert!(status["drift"].is_object());
+    assert!(status["background"]["supported"].is_boolean());
+    assert!(status["background"]["detail"].is_string());
+}
+
+#[test]
+fn unconfigured_status_json_has_a_stable_setup_envelope() {
+    let temp = setup_fixture();
+    let root = temp.path();
+
+    let status: Value = serde_json::from_str(&run(root, &["status", "--format", "json"])).unwrap();
+
+    assert_eq!(status["configured"], false);
+    assert_eq!(status["healthy"], false);
+    assert_eq!(status["next_action"], "setup");
+    assert!(status["inventory"].is_object());
+}
+
+#[test]
+fn configured_status_failure_still_returns_json_on_stdout() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    write(
+        &root.join(".agent-sync/config.toml"),
+        "not valid toml = [\n",
+    );
+
+    let output = run_output(root, &["status", "--format", "json"]);
+    assert!(!output.status.success());
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["healthy"], false);
+    assert_eq!(status["next_action"], "doctor");
+    assert!(status["error"].is_string());
+    assert!(status["background"].is_object());
+}
+
+#[test]
+fn no_command_uses_noninteractive_status_without_writing() {
+    let temp = setup_fixture();
+    let root = temp.path();
+
+    let output = run(root, &[]);
+
+    assert!(output.contains("No managed sync is configured"));
+    assert!(!root.join(".agent-sync/config.toml").exists());
 }

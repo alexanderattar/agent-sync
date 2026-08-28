@@ -13,26 +13,31 @@ use serde::{Deserialize, Serialize};
 use crate::{
     adapters::{AgentKind, AgentPaths},
     agent_skill::{
-        install_agent_skill, AgentSkillInstallAction, AgentSkillInstallOptions,
-        AgentSkillInstallReport,
+        install_agent_skills, AgentSkillInstallAction, AgentSkillInstallOptions,
+        AgentSkillInstallSetReport,
     },
     apply::{apply_pack, diff_pack, verify_pack, ApplyOptions, Change, ChangeAction},
-    config::{load_config, render_config, save_config, CanonicalSource, Config, McpMode},
+    config::{load_config, render_config, CanonicalSource, Config, McpMode},
     cursor_history::{
-        cursor_history_coverage, install_cursor_history_hook_with_refresh, qmd_executable,
-        qmd_export_is_indexed, qmd_health, qmd_pending_exports, qmd_refresh_last_success,
-        refresh_qmd_index, remove_cursor_history_hook, sweep_cursor_history,
+        cursor_history_coverage_at, cursor_history_unreadable_count,
+        default_cursor_history_output_dir, ensure_qmd_collection,
+        install_cursor_history_hook_with_refresh, qmd_executable, qmd_health, qmd_missing_exports,
+        qmd_pending_exports, qmd_refresh_last_success, refresh_pending_qmd_index_for_output,
+        refresh_qmd_index_for_output, remove_cursor_history_hook, sweep_cursor_history_report_to,
     },
     fsx::{
-        ensure_dir, hash_path, read_to_string_if_exists, replace_file_with_backup, write_atomic,
+        ensure_dir, hash_bytes, hash_path, read_to_string_if_exists, remove_target_if_unchanged,
+        replace_file_with_backup_if_unchanged, restore_backup_atomically_if_unchanged,
+        write_atomic,
     },
-    mcp::{discover_claude_mcp, discover_codex_mcp, ensure_cursor_mcp_write_safe},
+    mcp::{
+        discover_claude_mcp, discover_codex_mcp, discover_cursor_mcp, ensure_cursor_mcp_write_safe,
+    },
     pack::{export_pack, ExportOptions, SourceSelection},
 };
 
 const RUN_STATE_VERSION: u32 = 1;
-const SYNC_LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
-
+const PERSISTENT_LOCK_HARD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupOptions {
     pub dry_run: bool,
@@ -44,7 +49,7 @@ pub struct SetupReport {
     pub config_path: PathBuf,
     pub config_changed: bool,
     pub config_backup: Option<PathBuf>,
-    pub skill: AgentSkillInstallReport,
+    pub skill: AgentSkillInstallSetReport,
     pub policy_summary: String,
 }
 
@@ -93,7 +98,7 @@ pub fn setup_managed(
     ensure_regular_or_missing(config_path, "managed config")?;
     let rendered = render_config(config)?;
     let config_changed = read_to_string_if_exists(config_path)?.as_deref() != Some(&rendered);
-    let skill_preview = install_agent_skill(paths, AgentSkillInstallOptions { dry_run: true })?;
+    let skill_preview = install_agent_skills(paths, AgentSkillInstallOptions { dry_run: true })?;
 
     if options.dry_run {
         return Ok(SetupReport {
@@ -107,7 +112,14 @@ pub fn setup_managed(
     }
 
     let original_config = if config_changed {
-        fs::read(config_path).ok()
+        match fs::read(config_path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read managed config {}", config_path.display()));
+            }
+        }
     } else {
         None
     };
@@ -116,21 +128,30 @@ pub fn setup_managed(
         .join(".agent-sync/backups")
         .join(Utc::now().format("%Y%m%dT%H%M%S%.9fZ").to_string())
         .join("setup");
-    let config_backup = if !config_changed {
-        None
-    } else if config_path.exists() {
-        replace_file_with_backup(&backup_root, &paths.home, config_path, rendered.as_bytes())?
+    let config_backup = if config_changed {
+        replace_file_with_backup_if_unchanged(
+            &backup_root,
+            &paths.home,
+            config_path,
+            original_config.as_deref(),
+            rendered.as_bytes(),
+        )?
     } else {
-        save_config(config_path, config)?;
         None
     };
-    let skill = match install_agent_skill(paths, AgentSkillInstallOptions { dry_run: false }) {
+    let skill = match install_agent_skills(paths, AgentSkillInstallOptions { dry_run: false }) {
         Ok(report) => report,
         Err(error) => {
-            let rollback = match (config_changed, original_config) {
-                (true, Some(content)) => write_atomic(config_path, &content),
-                (true, None) => fs::remove_file(config_path)
-                    .with_context(|| format!("remove new config {}", config_path.display())),
+            let installed_sha256 = hash_bytes(rendered.as_bytes());
+            let rollback = match (config_changed, original_config.as_ref()) {
+                (true, Some(_)) => restore_backup_atomically_if_unchanged(
+                    config_backup
+                        .as_deref()
+                        .context("updated config backup was not recorded")?,
+                    config_path,
+                    &installed_sha256,
+                ),
+                (true, None) => remove_target_if_unchanged(config_path, &installed_sha256),
                 (false, _) => Ok(()),
             };
             if let Err(rollback_error) = rollback {
@@ -160,13 +181,122 @@ pub struct ChangeCounts {
     pub preserved: usize,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CursorHistoryMode {
+    Disabled,
+    ExportOnly,
+    Qmd,
+}
+
+impl CursorHistoryMode {
+    fn from_config(config: &Config) -> Self {
+        match (
+            config.cursor_history.enabled,
+            config.cursor_history.refresh_qmd,
+        ) {
+            (false, _) => Self::Disabled,
+            (true, false) => Self::ExportOnly,
+            (true, true) => Self::Qmd,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::ExportOnly => "enabled without QMD refresh",
+            Self::Qmd => "enabled with QMD refresh",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatusNextAction {
+    None,
+    PreviewSync,
+    RunDoctor,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StatusLastSuccess {
+    pub finished_at: DateTime<Utc>,
+    pub result: RunResult,
+    pub agent_sync_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedStatus {
+    pub source: CanonicalSource,
+    pub targets: Vec<AgentKind>,
+    pub cursor_history: CursorHistoryMode,
+    pub drift: ChangeCounts,
+    pub last_success: Option<StatusLastSuccess>,
+    pub healthy: bool,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+    pub next_action: StatusNextAction,
+}
+
+impl ManagedStatus {
+    pub fn to_text(&self) -> String {
+        let mut out = format!(
+            "Managed route: {} -> {}\nCursor history: {}\nDrift: {} add, {} update, {} preserved, {} unchanged\n",
+            self.source.agent_kind(),
+            self.targets
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            self.cursor_history.label(),
+            self.drift.add,
+            self.drift.update,
+            self.drift.preserved,
+            self.drift.unchanged
+        );
+        match &self.last_success {
+            Some(record) => out.push_str(&format!(
+                "Last successful sync: {} ({:?}, agent-sync {})\n",
+                record.finished_at.to_rfc3339(),
+                record.result,
+                record.agent_sync_version
+            )),
+            None => out.push_str("Last successful sync: never\n"),
+        }
+        out.push_str(
+            if !self.healthy && self.next_action == StatusNextAction::PreviewSync {
+                "Health: first sync or repair is ready to preview\n"
+            } else if self.healthy && self.warnings.is_empty() {
+                "Health: healthy\n"
+            } else if self.healthy {
+                "Health: healthy with warnings\n"
+            } else {
+                "Health: needs attention; run `agent-sync doctor`\n"
+            },
+        );
+        for warning in &self.warnings {
+            out.push_str(&format!("Warning: {warning}\n"));
+        }
+        out.push_str(match self.next_action {
+            StatusNextAction::PreviewSync => {
+                "Next action: run `agent-sync sync` to preview the repair.\n"
+            }
+            StatusNextAction::RunDoctor => {
+                "Next action: run `agent-sync doctor` for the failing checks.\n"
+            }
+            StatusNextAction::None => "Next action: none.\n",
+        });
+        out
+    }
+}
+
 impl ChangeCounts {
     fn from_changes(changes: &[Change]) -> Self {
         let mut counts = Self::default();
         for change in changes {
             match change.action {
                 ChangeAction::Add => counts.add += 1,
-                ChangeAction::Update => counts.update += 1,
+                ChangeAction::Update | ChangeAction::ManagedUpdate => counts.update += 1,
                 ChangeAction::Unchanged => counts.unchanged += 1,
                 ChangeAction::Skip => counts.preserved += 1,
             }
@@ -177,6 +307,13 @@ impl ChangeCounts {
     fn has_writes(self) -> bool {
         self.add > 0 || self.update > 0
     }
+}
+
+fn plain_update_count(changes: &[Change]) -> usize {
+    changes
+        .iter()
+        .filter(|change| change.action == ChangeAction::Update)
+        .count()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -219,6 +356,8 @@ pub struct RunRecord {
     pub bundled_skill_changed: bool,
     #[serde(default)]
     pub cursor_history_checked: usize,
+    #[serde(default)]
+    pub cursor_history_unreadable: usize,
     pub history_hook_changed: bool,
     pub qmd_refreshed: bool,
     pub backup_root: Option<PathBuf>,
@@ -239,6 +378,7 @@ struct SyncProgress {
     verification_ok: bool,
     bundled_skill_changed: bool,
     cursor_history_checked: usize,
+    cursor_history_unreadable: usize,
     history_hook_changed: bool,
     qmd_refreshed: bool,
     backup_root: Option<PathBuf>,
@@ -303,10 +443,21 @@ impl SyncReport {
                 out.push_str("Run `agent-sync sync --yes` to apply this plan.\n");
             }
         }
+        if self.record.cursor_history_unreadable > 0 {
+            out.push_str(&format!(
+                "Skipped {} unreadable Cursor transcript(s); run `agent-sync doctor` for details.\n",
+                self.record.cursor_history_unreadable
+            ));
+        }
         let writable = self
             .changes
             .iter()
-            .filter(|change| matches!(change.action, ChangeAction::Add | ChangeAction::Update))
+            .filter(|change| {
+                matches!(
+                    change.action,
+                    ChangeAction::Add | ChangeAction::Update | ChangeAction::ManagedUpdate
+                )
+            })
             .collect::<Vec<_>>();
         if !writable.is_empty() {
             out.push_str("Planned changes:\n");
@@ -317,7 +468,7 @@ impl SyncReport {
                 ));
             }
         }
-        if self.record.before.update > 0 && !self.updates_allowed {
+        if plain_update_count(&self.changes) > 0 && !self.updates_allowed {
             out.push_str(
                 "This plan is blocked because target replacements are disabled. Keep the target-owned content or explicitly enable updates during setup.\n",
             );
@@ -448,6 +599,7 @@ pub fn sync_managed(
                 verification_ok: progress.verification_ok,
                 bundled_skill_changed: progress.bundled_skill_changed,
                 cursor_history_checked: progress.cursor_history_checked,
+                cursor_history_unreadable: progress.cursor_history_unreadable,
                 history_hook_changed: progress.history_hook_changed,
                 qmd_refreshed: progress.qmd_refreshed,
                 backup_root: progress.backup_root,
@@ -504,17 +656,26 @@ fn sync_inner(
         .collect::<Vec<_>>();
     progress.preserved = preserved.clone();
     progress.phase = "skill-preflight";
-    let skill_preview = install_agent_skill(paths, AgentSkillInstallOptions { dry_run: true })?;
+    let skill_preview = install_agent_skills(paths, AgentSkillInstallOptions { dry_run: true })?;
+    let history_output_dir = config
+        .cursor_history
+        .enabled
+        .then(|| cursor_history_output_dir(paths, config))
+        .transpose()?;
     progress.phase = "history-preflight";
     let history_hook_preview = if config.cursor_history.enabled {
+        let output_dir = history_output_dir
+            .as_deref()
+            .context("Cursor history output directory was not resolved")?;
         let hook = install_cursor_history_hook_with_refresh(
             paths,
             executable,
+            output_dir,
             true,
             config.cursor_history.refresh_qmd,
         )?;
-        if config.cursor_history.refresh_qmd {
-            verify_qmd_health(paths, false)?;
+        if config.cursor_history.refresh_qmd && !ensure_qmd_collection(paths, true)? {
+            verify_qmd_health(paths, output_dir)?;
         }
         hook.changed
     } else {
@@ -522,6 +683,7 @@ fn sync_inner(
     };
 
     if options.dry_run {
+        let updates_allowed = config.allow_updates || plain_update_count(&changes) == 0;
         return Ok(SyncReport {
             record: RunRecord {
                 version: RUN_STATE_VERSION,
@@ -544,6 +706,7 @@ fn sync_inner(
                 verification_ok: false,
                 bundled_skill_changed: false,
                 cursor_history_checked: 0,
+                cursor_history_unreadable: 0,
                 history_hook_changed: history_hook_preview,
                 qmd_refreshed: false,
                 backup_root: None,
@@ -553,49 +716,56 @@ fn sync_inner(
             changes,
             new_preserved: Vec::new(),
             automation: options.automation,
-            updates_allowed: config.allow_updates,
-            skill_action: skill_preview.action,
+            updates_allowed,
+            skill_action: skill_preview.action(),
             qmd_refresh_enabled: config.cursor_history.enabled && config.cursor_history.refresh_qmd,
             cursor_history_sweep_enabled: config.cursor_history.enabled,
         });
     }
 
-    if before.update > 0 && !config.allow_updates {
+    let blocked_updates = plain_update_count(&changes);
+    if blocked_updates > 0 && !config.allow_updates {
         progress.phase = "policy";
         bail!(
             "sync is blocked because {} update(s) require replacing target content; review `agent-sync sync` and enable allow_updates explicitly only if replacement is intended",
-            before.update
+            blocked_updates
         );
     }
 
     progress.phase = "skill-reconcile";
-    let skill = install_agent_skill(paths, AgentSkillInstallOptions { dry_run: false })?;
-    let bundled_skill_changed = skill.action != AgentSkillInstallAction::Unchanged;
+    let skill = install_agent_skills(paths, AgentSkillInstallOptions { dry_run: false })?;
+    let bundled_skill_changed = skill.action() != AgentSkillInstallAction::Unchanged;
     progress.bundled_skill_changed = bundled_skill_changed;
 
     let mut qmd_refreshed = false;
     let mut cursor_history_checked = 0;
     progress.phase = "history-preflight";
     if config.cursor_history.enabled {
+        let output_dir = history_output_dir
+            .as_deref()
+            .context("Cursor history output directory was not resolved")?;
         install_cursor_history_hook_with_refresh(
             paths,
             executable,
+            output_dir,
             true,
             config.cursor_history.refresh_qmd,
         )?;
         progress.phase = "history-sweep";
-        cursor_history_checked = sweep_cursor_history(paths, config.cursor_history.refresh_qmd)?;
-        progress.cursor_history_checked = cursor_history_checked;
+        let sweep =
+            sweep_cursor_history_report_to(paths, output_dir, config.cursor_history.refresh_qmd)?;
+        cursor_history_checked = sweep.exported;
+        progress.cursor_history_checked = sweep.exported;
+        progress.cursor_history_unreadable = sweep.unreadable.len();
         if config.cursor_history.refresh_qmd {
-            verify_qmd_health(paths, false)?;
+            ensure_qmd_collection(paths, false)?;
             progress.phase = "qmd-refresh";
-            qmd_refreshed = refresh_qmd_index(paths, true)?;
+            qmd_refreshed = if progress.cursor_history_unreadable > 0 {
+                refresh_pending_qmd_index_for_output(paths, output_dir, true)?
+            } else {
+                refresh_qmd_index_for_output(paths, output_dir, true)?
+            };
             progress.qmd_refreshed = qmd_refreshed;
-            verify_qmd_health(paths, true)?;
-            let pending = qmd_pending_exports(paths)?;
-            if pending > 0 {
-                bail!("{pending} Cursor history export(s) still await QMD indexing");
-            }
         }
     } else {
         remove_cursor_history_hook(paths, true)?;
@@ -653,9 +823,13 @@ fn sync_inner(
 
     progress.phase = "history-reconcile";
     let history_hook_changed = if config.cursor_history.enabled {
+        let output_dir = history_output_dir
+            .as_deref()
+            .context("Cursor history output directory was not resolved")?;
         let hook = install_cursor_history_hook_with_refresh(
             paths,
             executable,
+            output_dir,
             false,
             config.cursor_history.refresh_qmd,
         )?;
@@ -665,13 +839,16 @@ fn sync_inner(
     };
     progress.history_hook_changed = history_hook_changed;
     let changed = applied_before.has_writes() || bundled_skill_changed || history_hook_changed;
+    let updates_allowed = config.allow_updates || plain_update_count(&applied.changes) == 0;
     Ok(SyncReport {
         record: RunRecord {
             version: RUN_STATE_VERSION,
             run_id: String::new(),
             started_at: Utc::now(),
             finished_at: Utc::now(),
-            result: if changed {
+            result: if progress.cursor_history_unreadable > 0 {
+                RunResult::Attention
+            } else if changed {
                 RunResult::Changed
             } else {
                 RunResult::Healthy
@@ -691,6 +868,7 @@ fn sync_inner(
             verification_ok: true,
             bundled_skill_changed,
             cursor_history_checked,
+            cursor_history_unreadable: progress.cursor_history_unreadable,
             history_hook_changed,
             qmd_refreshed,
             backup_root: applied.backup_root,
@@ -700,8 +878,8 @@ fn sync_inner(
         changes: applied.changes,
         new_preserved: Vec::new(),
         automation: options.automation,
-        updates_allowed: config.allow_updates,
-        skill_action: skill.action,
+        updates_allowed,
+        skill_action: skill.action(),
         qmd_refresh_enabled: config.cursor_history.enabled && config.cursor_history.refresh_qmd,
         cursor_history_sweep_enabled: config.cursor_history.enabled,
     })
@@ -737,7 +915,7 @@ impl HealthReport {
 
 pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path) -> HealthReport {
     let mut checks = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     let mut errors = Vec::new();
 
     let config = match load_config(config_path) {
@@ -756,6 +934,31 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
         }
     };
 
+    doctor_managed_with_config(
+        paths,
+        config_path,
+        executable,
+        &config,
+        true,
+        None,
+        checks,
+        warnings,
+        errors,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn doctor_managed_with_config(
+    paths: &AgentPaths,
+    config_path: &Path,
+    executable: &Path,
+    config: &Config,
+    deep_cursor_history: bool,
+    drift: Option<&Result<Vec<Change>>>,
+    mut checks: Vec<String>,
+    mut warnings: Vec<String>,
+    mut errors: Vec<String>,
+) -> HealthReport {
     for (label, path) in [
         ("agent sync", state_dir(paths).join("sync.lock")),
         ("QMD refresh", state_dir(paths).join("qmd-refresh.lock")),
@@ -818,28 +1021,50 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
         }
     }
 
-    if let Err(error) = preflight(paths, &config) {
+    if matches!(drift, Some(Ok(_))) {
+        checks.push("source, target, and MCP policy passed preflight".to_string());
+    } else if let Err(error) = preflight(paths, config) {
         errors.push(format!("preflight: {error:#}"));
     } else {
         checks.push("source, target, and MCP policy passed preflight".to_string());
     }
 
-    match install_agent_skill(paths, AgentSkillInstallOptions { dry_run: true }) {
-        Ok(report) if report.action == AgentSkillInstallAction::Unchanged => {
+    match install_agent_skills(paths, AgentSkillInstallOptions { dry_run: true }) {
+        Ok(report) if report.action() == AgentSkillInstallAction::Unchanged => {
             checks.push("natural-language agent-sync skill is installed".to_string());
         }
         Ok(report) => errors.push(format!(
-            "natural-language skill needs {:?} at {}",
-            report.action,
-            report.destination.display()
+            "natural-language skill needs {:?}: {}",
+            report.action(),
+            report
+                .installations
+                .iter()
+                .filter(|installation| {
+                    installation.action != AgentSkillInstallAction::Unchanged
+                })
+                .map(|installation| installation.destination.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
         Err(error) => errors.push(format!("natural-language skill: {error:#}")),
     }
 
-    if config.cursor_history.enabled {
+    let history_output_dir = if config.cursor_history.enabled {
+        match cursor_history_output_dir(paths, config) {
+            Ok(output_dir) => Some(output_dir),
+            Err(error) => {
+                errors.push(format!("Cursor history output: {error:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(output_dir) = history_output_dir.as_deref() {
         match install_cursor_history_hook_with_refresh(
             paths,
             executable,
+            output_dir,
             true,
             config.cursor_history.refresh_qmd,
         ) {
@@ -849,27 +1074,32 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
             Ok(_) => errors.push("Cursor history hook is missing or stale".to_string()),
             Err(error) => errors.push(format!("Cursor history hook: {error:#}")),
         }
-        let history_coverage = match cursor_history_coverage(paths) {
-            Ok(coverage) if coverage.is_complete() => {
-                checks.push(format!(
-                    "{} Cursor transcript(s) have current Markdown exports",
-                    coverage.transcripts
-                ));
-                Some(coverage)
+        let history_coverage = if deep_cursor_history {
+            match cursor_history_coverage_at(paths, output_dir) {
+                Ok(coverage) if coverage.is_complete() => {
+                    checks.push(format!(
+                        "{} Cursor transcript(s) have current Markdown exports",
+                        coverage.transcripts
+                    ));
+                    Some(coverage)
+                }
+                Ok(coverage) => {
+                    errors.push(format!(
+                        "Cursor history coverage is incomplete: {} missing, {} stale, {} unreadable",
+                        coverage.missing.len(),
+                        coverage.stale.len(),
+                        coverage.unreadable.len()
+                    ));
+                    None
+                }
+                Err(error) => {
+                    errors.push(format!("Cursor history coverage: {error:#}"));
+                    None
+                }
             }
-            Ok(coverage) => {
-                errors.push(format!(
-                    "Cursor history coverage is incomplete: {} missing, {} stale, {} unreadable",
-                    coverage.missing.len(),
-                    coverage.stale.len(),
-                    coverage.unreadable.len()
-                ));
-                None
-            }
-            Err(error) => {
-                errors.push(format!("Cursor history coverage: {error:#}"));
-                None
-            }
+        } else {
+            report_unreadable_cursor_history(paths, &mut errors);
+            None
         };
         if config.cursor_history.refresh_qmd {
             match qmd_executable(paths) {
@@ -885,7 +1115,7 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
             }
             match qmd_health(paths) {
                 Ok(health) => {
-                    match verify_qmd_sessions_path(paths, &health.sessions_path) {
+                    match verify_qmd_sessions_path(output_dir, &health.sessions_path) {
                         Ok(expected) => checks.push(format!(
                             "QMD sessions collection covers {}",
                             expected.display()
@@ -895,8 +1125,8 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
                     if health.pending_embeddings == 0 {
                         checks.push("QMD has no pending embeddings".to_string());
                     } else {
-                        errors.push(format!(
-                            "QMD has {} pending embedding(s)",
+                        warnings.push(format!(
+                            "QMD reports {} pending embedding(s); agent-sync exports are checked separately",
                             health.pending_embeddings
                         ));
                     }
@@ -904,32 +1134,23 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
                 Err(error) => errors.push(format!("QMD health: {error:#}")),
             }
             if let Some(coverage) = &history_coverage {
-                let mut missing_from_qmd = Vec::new();
-                let mut lookup_failed = false;
-                for export in &coverage.expected_exports {
-                    match qmd_export_is_indexed(paths, export) {
-                        Ok(true) => {}
-                        Ok(false) => missing_from_qmd.push(export.display().to_string()),
-                        Err(error) => {
-                            lookup_failed = true;
-                            errors.push(format!(
-                                "QMD export lookup for {}: {error:#}",
-                                export.display()
-                            ));
-                        }
-                    }
-                }
-                if missing_from_qmd.is_empty() && !lookup_failed {
-                    checks.push(format!(
+                match qmd_missing_exports(paths, &coverage.expected_exports) {
+                    Ok(missing_from_qmd) if missing_from_qmd.is_empty() => checks.push(format!(
                         "{} Cursor history export(s) are retrievable from QMD",
                         coverage.expected_exports.len()
-                    ));
-                } else if !missing_from_qmd.is_empty() {
-                    errors.push(format!(
+                    )),
+                    Ok(missing_from_qmd) => errors.push(format!(
                         "{} Cursor history export(s) are missing from QMD: {}",
                         missing_from_qmd.len(),
-                        missing_from_qmd.join(", ")
-                    ));
+                        missing_from_qmd
+                            .iter()
+                            .map(|export| export.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                    Err(error) => {
+                        errors.push(format!("QMD export lookup: {error:#}"));
+                    }
                 }
             }
             match qmd_pending_exports(paths) {
@@ -940,7 +1161,7 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
                 Err(error) => errors.push(format!("QMD pending export state: {error:#}")),
             }
         }
-    } else {
+    } else if !config.cursor_history.enabled {
         match remove_cursor_history_hook(paths, true) {
             Ok(report) if !report.changed => {
                 checks.push("managed Cursor history hook is disabled".to_string())
@@ -953,9 +1174,16 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
         }
     }
 
-    match current_changes(paths, &config) {
+    let owned_drift;
+    let drift = if let Some(drift) = drift {
+        drift
+    } else {
+        owned_drift = current_changes(paths, config);
+        &owned_drift
+    };
+    match drift {
         Ok(changes) => {
-            let counts = ChangeCounts::from_changes(&changes);
+            let counts = ChangeCounts::from_changes(changes);
             if counts.has_writes() {
                 errors.push(format!(
                     "configuration drift: {} addition(s), {} update(s); run agent-sync sync",
@@ -1071,56 +1299,67 @@ pub fn doctor_managed(paths: &AgentPaths, config_path: &Path, executable: &Path)
     }
 }
 
-pub fn status_managed(paths: &AgentPaths, config_path: &Path, executable: &Path) -> Result<String> {
-    let config = load_config(config_path)?;
-    let changes = current_changes(paths, &config)?;
-    let counts = ChangeCounts::from_changes(&changes);
-    let health = doctor_managed(paths, config_path, executable);
-    let cursor_history = if config.cursor_history.enabled {
-        if config.cursor_history.refresh_qmd {
-            "enabled with QMD refresh"
-        } else {
-            "enabled without QMD refresh"
-        }
-    } else {
-        "disabled"
-    };
-    let mut out = format!(
-        "Managed route: {} -> {}\nCursor history: {cursor_history}\nDrift: {} add, {} update, {} preserved, {} unchanged\n",
-        config.source.agent_kind(),
-        config
-            .targets
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-        counts.add,
-        counts.update,
-        counts.preserved,
-        counts.unchanged
-    );
-    match load_last_success(paths)? {
-        Some(record) => out.push_str(&format!(
-            "Last successful sync: {} ({:?}, agent-sync {})\n",
-            record.finished_at.to_rfc3339(),
-            record.result,
-            record.agent_sync_version
+fn report_unreadable_cursor_history(paths: &AgentPaths, errors: &mut Vec<String>) {
+    match cursor_history_unreadable_count(paths) {
+        Ok(0) => {}
+        Ok(count) => errors.push(format!(
+            "Cursor history coverage is incomplete: {count} unreadable transcript(s)"
         )),
-        None => out.push_str("Last successful sync: never\n"),
+        Err(error) => errors.push(format!("Cursor history coverage: {error:#}")),
     }
-    out.push_str(if health.ok {
-        "Health: healthy\n"
-    } else {
-        "Health: needs attention; run `agent-sync doctor`\n"
+}
+
+pub fn status_managed(paths: &AgentPaths, config_path: &Path, executable: &Path) -> Result<String> {
+    Ok(status_managed_report(paths, config_path, executable)?.to_text())
+}
+
+pub fn status_managed_report(
+    paths: &AgentPaths,
+    config_path: &Path,
+    executable: &Path,
+) -> Result<ManagedStatus> {
+    let config = load_config(config_path)?;
+    let drift = current_changes(paths, &config);
+    let counts = match &drift {
+        Ok(changes) => ChangeCounts::from_changes(changes),
+        Err(_) => ChangeCounts::default(),
+    };
+    let health = doctor_managed_with_config(
+        paths,
+        config_path,
+        executable,
+        &config,
+        false,
+        Some(&drift),
+        vec![format!("config is valid at {}", config_path.display())],
+        Vec::new(),
+        Vec::new(),
+    );
+    let last_success = load_last_success(paths)?.map(|record| StatusLastSuccess {
+        finished_at: record.finished_at,
+        result: record.result,
+        agent_sync_version: record.agent_sync_version,
     });
-    if counts.has_writes() {
-        out.push_str("Next action: run `agent-sync sync` to preview the repair.\n");
+    let next_action = if last_success.is_none() || counts.has_writes() {
+        StatusNextAction::PreviewSync
     } else if !health.ok {
-        out.push_str("Next action: run `agent-sync doctor` for the failing checks.\n");
+        StatusNextAction::RunDoctor
     } else {
-        out.push_str("Next action: none.\n");
-    }
-    Ok(out)
+        StatusNextAction::None
+    };
+    let cursor_history = CursorHistoryMode::from_config(&config);
+
+    Ok(ManagedStatus {
+        source: config.source,
+        targets: config.targets,
+        cursor_history,
+        drift: counts,
+        last_success,
+        healthy: health.ok,
+        warnings: health.warnings,
+        errors: health.errors,
+        next_action,
+    })
 }
 
 fn format_config_summary(config: &Config) -> String {
@@ -1153,23 +1392,20 @@ fn format_config_summary(config: &Config) -> String {
     )
 }
 
-fn verify_qmd_health(paths: &AgentPaths, require_zero_pending: bool) -> Result<()> {
+fn cursor_history_output_dir(paths: &AgentPaths, _config: &Config) -> Result<PathBuf> {
+    Ok(default_cursor_history_output_dir(paths))
+}
+
+fn verify_qmd_health(paths: &AgentPaths, output_dir: &Path) -> Result<()> {
     let health = qmd_health(paths)?;
-    verify_qmd_sessions_path(paths, &health.sessions_path)?;
-    if require_zero_pending && health.pending_embeddings > 0 {
-        bail!(
-            "QMD still has {} pending embedding(s) after refresh",
-            health.pending_embeddings
-        );
-    }
+    verify_qmd_sessions_path(output_dir, &health.sessions_path)?;
     Ok(())
 }
 
-fn verify_qmd_sessions_path(paths: &AgentPaths, sessions_path: &Path) -> Result<PathBuf> {
-    let expected = paths.home.join("Documents/Obsidian/sessions");
+fn verify_qmd_sessions_path(expected: &Path, sessions_path: &Path) -> Result<PathBuf> {
     let actual_path =
         fs::canonicalize(sessions_path).unwrap_or_else(|_| sessions_path.to_path_buf());
-    let expected_path = fs::canonicalize(&expected).unwrap_or(expected);
+    let expected_path = fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
     if actual_path != expected_path {
         bail!(
             "QMD sessions collection points to {}, expected {}",
@@ -1195,6 +1431,7 @@ fn export_options(config: &Config) -> ExportOptions {
         source: match config.source {
             CanonicalSource::Codex => SourceSelection::Codex,
             CanonicalSource::Claude => SourceSelection::Claude,
+            CanonicalSource::Cursor => SourceSelection::Cursor,
         },
         include_references: config.include_references,
         include_mcp: config.mcp.mode != McpMode::None,
@@ -1210,6 +1447,7 @@ fn preflight(paths: &AgentPaths, config: &Config) -> Result<()> {
     let source_root = match config.source {
         CanonicalSource::Codex => &paths.codex_home,
         CanonicalSource::Claude => &paths.claude_home,
+        CanonicalSource::Cursor => &paths.cursor_home,
     };
     if !source_root.is_dir() {
         bail!("source directory does not exist: {}", source_root.display());
@@ -1221,6 +1459,7 @@ fn preflight(paths: &AgentPaths, config: &Config) -> Result<()> {
         let available = match config.source {
             CanonicalSource::Codex => discover_codex_mcp(&paths.codex_home.join("config.toml"))?,
             CanonicalSource::Claude => discover_claude_mcp(&paths.claude_config)?,
+            CanonicalSource::Cursor => discover_cursor_mcp(&paths.cursor_config)?,
         };
         let missing = config
             .mcp
@@ -1418,15 +1657,9 @@ impl SyncLock {
                     let Some(snapshot) = read_sync_lock_snapshot(&path)? else {
                         continue;
                     };
-                    if lock_token_owner_is_active(&snapshot.token) {
-                        bail!("another agent-sync run is active ({})", path.display());
-                    }
-                    let stale = snapshot
-                        .modified
-                        .elapsed()
-                        .ok()
-                        .is_some_and(|age| age >= SYNC_LOCK_STALE_AFTER);
-                    if !stale {
+                    if lock_token_owner_is_active(&snapshot.token)
+                        && !sync_lock_hard_expired(&snapshot)
+                    {
                         bail!("another agent-sync run is active ({})", path.display());
                     }
                     if remove_sync_lock_if_unchanged(&path, &snapshot)? {
@@ -1450,9 +1683,29 @@ impl Drop for SyncLock {
 }
 
 fn sync_lock_owner_is_active(path: &Path) -> bool {
-    fs::read_to_string(path)
+    read_sync_lock_snapshot(path)
         .ok()
-        .is_some_and(|token| lock_token_owner_is_active(&token))
+        .flatten()
+        .is_some_and(|snapshot| {
+            !sync_lock_hard_expired(&snapshot) && lock_token_owner_is_active(&snapshot.token)
+        })
+}
+
+fn sync_lock_hard_expired(snapshot: &SyncLockSnapshot) -> bool {
+    let now = Utc::now().timestamp_millis();
+    let token_age = snapshot
+        .token
+        .split_once(':')
+        .and_then(|(_, timestamp)| timestamp.trim().parse::<i64>().ok())
+        .and_then(|timestamp| now.checked_sub(timestamp))
+        .and_then(|millis| u64::try_from(millis).ok())
+        .map(Duration::from_millis);
+    let modified_age = snapshot.modified.elapsed().ok();
+    (match (token_age, modified_age) {
+        (Some(token), Some(modified)) => token.max(modified),
+        (Some(age), None) | (None, Some(age)) => age,
+        (None, None) => return false,
+    }) >= PERSISTENT_LOCK_HARD_MAX_AGE
 }
 
 fn lock_token_owner_is_active(token: &str) -> bool {
@@ -1550,5 +1803,122 @@ fn remove_sync_lock_if_unchanged(path: &Path, expected: &SyncLockSnapshot) -> Re
         Ok(()) => Ok(true),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error).context("remove stale sync lock"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquire_replaces_a_lock_owned_by_a_dead_process_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let state = state_dir(&paths);
+        ensure_dir(&state).unwrap();
+        let path = state.join("sync.lock");
+        fs::write(
+            &path,
+            format!("{}:{}\n", u32::MAX, Utc::now().timestamp_millis()),
+        )
+        .unwrap();
+
+        let lock = SyncLock::acquire(&paths).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), lock.token);
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_replaces_a_hard_expired_lock_with_a_reused_live_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let state = state_dir(&paths);
+        ensure_dir(&state).unwrap();
+        let path = state.join("sync.lock");
+        fs::write(&path, format!("{}:0\n", std::process::id())).unwrap();
+
+        let expired = read_sync_lock_snapshot(&path).unwrap().unwrap();
+        assert!(lock_token_owner_is_active(&expired.token));
+        assert!(sync_lock_hard_expired(&expired));
+
+        let lock = SyncLock::acquire(&paths).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), lock.token);
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routine_status_does_not_run_exact_qmd_export_lookups() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        fs::create_dir_all(&paths.codex_home).unwrap();
+        fs::create_dir_all(&paths.cursor_home).unwrap();
+        let transcript = paths
+            .cursor_home
+            .join("projects/example/agent-transcripts/session/session.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
+        )
+        .unwrap();
+        crate::cursor_history::export_cursor_history(
+            &paths,
+            &serde_json::json!({
+                "conversation_id": "session",
+                "transcript_path": transcript,
+            }),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.cursor_history.enabled = true;
+        config.cursor_history.refresh_qmd = true;
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, render_config(&config).unwrap()).unwrap();
+
+        let command_log = temp.path().join("qmd-commands.log");
+        let qmd = paths.home.join(".local/bin/qmd");
+        fs::create_dir_all(qmd.parent().unwrap()).unwrap();
+        let output_dir = default_cursor_history_output_dir(&paths);
+        fs::write(
+            &qmd,
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "printf '%s\\n' \"$1\" >> {}\n",
+                    "case \"$1\" in\n",
+                    "collection) printf '%s\\n' 'Path: {}' 'Pattern: **/*.md' 'Include: yes (default)' ;;\n",
+                    "status) printf '%s\\n' 'Pending: 0 need embedding' ;;\n",
+                    "multi-get) printf '[]\\n' ;;\n",
+                    "*) exit 9 ;;\n",
+                    "esac\n"
+                ),
+                test_shell_quote(&command_log),
+                output_dir.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&qmd, fs::Permissions::from_mode(0o755)).unwrap();
+
+        status_managed_report(&paths, &config_path, &std::env::current_exe().unwrap()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(command_log).unwrap(),
+            "collection\nstatus\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn test_shell_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
 }

@@ -69,8 +69,11 @@ impl Config {
         }
 
         self.mcp.validate()?;
-        if self.cursor_history.enabled && !self.targets.contains(&AgentKind::Cursor) {
-            bail!("cursor_history.enabled requires cursor in targets");
+        if self.cursor_history.enabled
+            && self.source != CanonicalSource::Cursor
+            && !self.targets.contains(&AgentKind::Cursor)
+        {
+            bail!("cursor_history.enabled requires cursor as the source or a target");
         }
         if self.cursor_history.refresh_qmd && !self.cursor_history.enabled {
             bail!("cursor_history.refresh_qmd requires cursor_history.enabled");
@@ -87,6 +90,7 @@ impl Config {
 pub enum CanonicalSource {
     Codex,
     Claude,
+    Cursor,
 }
 
 impl CanonicalSource {
@@ -94,6 +98,7 @@ impl CanonicalSource {
         match self {
             Self::Codex => AgentKind::Codex,
             Self::Claude => AgentKind::Claude,
+            Self::Cursor => AgentKind::Cursor,
         }
     }
 }

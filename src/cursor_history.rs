@@ -1,9 +1,11 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error as StdError,
+    fmt,
     fs::{self, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,21 +16,30 @@ use walkdir::WalkDir;
 
 use crate::{
     adapters::AgentPaths,
-    fsx::{ensure_dir, read_to_string_if_exists, replace_file_with_backup, write_atomic},
+    fsx::{
+        ensure_dir, hash_bytes, read_to_string_if_exists, redact_known_secrets,
+        replace_file_with_backup_if_unchanged, write_atomic,
+    },
 };
 
-const CURSOR_HISTORY_HOOK_TIMEOUT_SECONDS: u64 = 300;
+const CURSOR_HISTORY_HOOK_TIMEOUT_SECONDS: u64 = 30;
 const MANAGED_HOOK_COMMAND_PREFIX: &str = "env AGENT_SYNC_CURSOR_HISTORY_HOOK=1 ";
 const MANAGED_HOOK_COMMAND_SUFFIX: &str = " cursor-history export";
 const MANAGED_HOOK_SKIP_QMD_COMMAND_SUFFIX: &str = " cursor-history export --skip-qmd";
+const MANAGED_HOOK_V1_SUFFIX: &str = " # agent-sync-managed-hook-v1";
 const QMD_REFRESH_LOCK_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+const PERSISTENT_LOCK_HARD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const QMD_REFRESH_LOCK_WAIT: Duration = Duration::from_millis(500);
+const QMD_DEFERRED_REFRESH_DELAY: Duration = Duration::from_secs(2);
 const CURSOR_EXPORT_LOCK_MAX_WAITS: usize = 240;
 const QMD_FORCE_LOCK_MAX_WAITS: usize = 1_200;
 const QMD_PENDING_MARKER_PREFIX: &str = "agent-sync-qmd-";
 const QMD_PENDING_MARKER_SUFFIX: &str = ".pending";
-const QMD_PENDING_MARKER_MAGIC: &str = "agent-sync-qmd-pending-v1";
-static QMD_PENDING_COUNTER: AtomicU64 = AtomicU64::new(0);
+const QMD_PENDING_MARKER_MAGIC_V1: &str = "agent-sync-qmd-pending-v1";
+const QMD_PENDING_MARKER_MAGIC_V2: &str = "agent-sync-qmd-pending-v2";
+const QMD_EXACT_LOOKUP_MAX_EXPORTS: usize = 64;
+const QMD_EXACT_LOOKUP_MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
+pub const QMD_CURSOR_COLLECTION: &str = "agent-sync-cursor";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CursorHistoryInstallReport {
@@ -84,6 +95,25 @@ pub struct CursorHistoryCoverage {
     pub unreadable: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CursorHistorySweepReport {
+    pub exported: usize,
+    pub unreadable: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct CursorTranscriptFormatError {
+    message: String,
+}
+
+impl fmt::Display for CursorTranscriptFormatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl StdError for CursorTranscriptFormatError {}
+
 impl CursorHistoryCoverage {
     pub fn is_complete(&self) -> bool {
         self.missing.is_empty() && self.stale.is_empty() && self.unreadable.is_empty()
@@ -123,26 +153,25 @@ pub fn install_cursor_history_hook(
     executable: &Path,
     dry_run: bool,
 ) -> Result<CursorHistoryInstallReport> {
-    install_cursor_history_hook_with_refresh(paths, executable, dry_run, true)
+    install_cursor_history_hook_with_refresh(
+        paths,
+        executable,
+        &default_cursor_history_output_dir(paths),
+        dry_run,
+        true,
+    )
 }
 
 pub fn install_cursor_history_hook_with_refresh(
     paths: &AgentPaths,
     executable: &Path,
+    output_dir: &Path,
     dry_run: bool,
     refresh_qmd: bool,
 ) -> Result<CursorHistoryInstallReport> {
     let hooks_path = paths.cursor_home.join("hooks.json");
     ensure_cursor_hooks_write_safe(&hooks_path)?;
-    let suffix = if refresh_qmd {
-        MANAGED_HOOK_COMMAND_SUFFIX
-    } else {
-        MANAGED_HOOK_SKIP_QMD_COMMAND_SUFFIX
-    };
-    let command = format!(
-        "{MANAGED_HOOK_COMMAND_PREFIX}{}{suffix}",
-        shell_quote(&executable.to_string_lossy())
-    );
+    let command = managed_hook_command(paths, executable, output_dir, refresh_qmd)?;
     let (_, changed) = render_cursor_hooks(&hooks_path, &command)?;
     if dry_run || !changed {
         return Ok(CursorHistoryInstallReport {
@@ -153,30 +182,66 @@ pub fn install_cursor_history_hook_with_refresh(
         });
     }
 
-    // Re-render from the latest Cursor-owned file immediately before writing so
-    // hooks added after the preview are included instead of overwritten.
-    let (content, changed) = render_cursor_hooks(&hooks_path, &command)?;
-    if !changed {
-        return Ok(CursorHistoryInstallReport {
-            changed: false,
-            dry_run: false,
-            hooks_path,
-            backup: None,
-        });
-    }
-
     let backup_root = paths
         .home
         .join(".agent-sync")
         .join("backups")
         .join(Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
-    let backup = replace_file_with_backup(&backup_root, &paths.cursor_home, &hooks_path, &content)?;
+    let (changed, backup) = apply_cursor_hook_edit(paths, &hooks_path, &backup_root, || {
+        render_cursor_hooks(&hooks_path, &command)
+    })?;
     Ok(CursorHistoryInstallReport {
         changed,
         dry_run,
         hooks_path,
         backup,
     })
+}
+
+fn managed_hook_command(
+    paths: &AgentPaths,
+    executable: &Path,
+    output_dir: &Path,
+    refresh_qmd: bool,
+) -> Result<String> {
+    let path_arguments = [
+        ("--home", paths.home.as_path()),
+        ("--codex-home", paths.codex_home.as_path()),
+        ("--claude-home", paths.claude_home.as_path()),
+        ("--claude-config", paths.claude_config.as_path()),
+        ("--cursor-home", paths.cursor_home.as_path()),
+        ("--cursor-config", paths.cursor_config.as_path()),
+        ("--agents-home", paths.agents_home.as_path()),
+    ];
+    let executable = executable.to_str().with_context(|| {
+        format!(
+            "agent-sync executable is not valid UTF-8: {}",
+            executable.display()
+        )
+    })?;
+    let mut command = format!("{MANAGED_HOOK_COMMAND_PREFIX}{}", shell_quote(executable));
+    for (flag, path) in path_arguments {
+        let value = path
+            .to_str()
+            .with_context(|| format!("{flag} path is not valid UTF-8: {}", path.display()))?;
+        command.push(' ');
+        command.push_str(flag);
+        command.push(' ');
+        command.push_str(&shell_quote(value));
+    }
+    command.push_str(MANAGED_HOOK_COMMAND_SUFFIX);
+    command.push_str(" --output-dir ");
+    command.push_str(&shell_quote(output_dir.to_str().with_context(|| {
+        format!(
+            "Cursor history output path is not valid UTF-8: {}",
+            output_dir.display()
+        )
+    })?));
+    if !refresh_qmd {
+        command.push_str(" --skip-qmd");
+    }
+    command.push_str(MANAGED_HOOK_V1_SUFFIX);
+    Ok(command)
 }
 
 pub fn remove_cursor_history_hook(
@@ -195,28 +260,58 @@ pub fn remove_cursor_history_hook(
         });
     }
 
-    let (content, changed) = render_cursor_hooks_without_managed(&hooks_path)?;
-    if !changed {
-        return Ok(CursorHistoryRemoveReport {
-            changed: false,
-            dry_run: false,
-            hooks_path,
-            backup: None,
-        });
-    }
-
     let backup_root = paths
         .home
         .join(".agent-sync")
         .join("backups")
         .join(Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
-    let backup = replace_file_with_backup(&backup_root, &paths.cursor_home, &hooks_path, &content)?;
+    let (changed, backup) = apply_cursor_hook_edit(paths, &hooks_path, &backup_root, || {
+        render_cursor_hooks_without_managed(&hooks_path)
+    })?;
     Ok(CursorHistoryRemoveReport {
         changed,
         dry_run: false,
         hooks_path,
         backup,
     })
+}
+
+fn apply_cursor_hook_edit<F>(
+    paths: &AgentPaths,
+    hooks_path: &Path,
+    backup_root: &Path,
+    mut render: F,
+) -> Result<(bool, Option<PathBuf>)>
+where
+    F: FnMut() -> Result<(Vec<u8>, bool)>,
+{
+    for _ in 0..3 {
+        let expected = read_bytes_if_exists(hooks_path)?;
+        let (content, changed) = render()?;
+        if !changed {
+            return Ok((false, None));
+        }
+        if read_bytes_if_exists(hooks_path)? != expected {
+            continue;
+        }
+        let backup = replace_file_with_backup_if_unchanged(
+            backup_root,
+            &paths.cursor_home,
+            hooks_path,
+            expected.as_deref(),
+            &content,
+        )?;
+        return Ok((true, backup));
+    }
+    anyhow::bail!("Cursor hooks changed repeatedly while applying; retry the sync")
+}
+
+fn read_bytes_if_exists(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 pub fn export_cursor_history_from_stdin(
@@ -236,8 +331,32 @@ pub fn export_cursor_history(
     output_dir: Option<PathBuf>,
     refresh_qmd: bool,
 ) -> Result<Option<PathBuf>> {
-    let export_lock = acquire_cursor_history_export_lock(paths)?;
+    let lock_mode = if running_from_cursor_hook() {
+        CursorHistoryLockMode::SkipIfBusy
+    } else {
+        CursorHistoryLockMode::Wait
+    };
+    export_cursor_history_with_lock_mode(paths, hook, output_dir, refresh_qmd, lock_mode)
+}
+
+#[derive(Clone, Copy)]
+enum CursorHistoryLockMode {
+    Wait,
+    SkipIfBusy,
+}
+
+fn export_cursor_history_with_lock_mode(
+    paths: &AgentPaths,
+    hook: &Value,
+    output_dir: Option<PathBuf>,
+    refresh_qmd: bool,
+    lock_mode: CursorHistoryLockMode,
+) -> Result<Option<PathBuf>> {
     let Some(transcript_path) = hook.get("transcript_path").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let export_lock = acquire_cursor_history_export_lock_for_mode(paths, lock_mode)?;
+    let Some(export_lock) = export_lock else {
         return Ok(None);
     };
     let transcript_path = PathBuf::from(transcript_path);
@@ -258,21 +377,9 @@ pub fn export_cursor_history(
 
     let raw = fs::read_to_string(&transcript_path)
         .with_context(|| format!("read {}", transcript_path.display()))?;
-    let turns = cursor_turns(&raw).with_context(|| {
-        format!(
-            "Cursor transcript {} has an unsupported entry; Cursor may have changed its transcript format",
-            transcript_path.display()
-        )
-    })?;
-    if turns.is_empty() {
-        if raw.trim().is_empty() {
-            return Ok(None);
-        }
-        anyhow::bail!(
-            "Cursor transcript {} contains no supported user or assistant turns; Cursor may have changed its transcript format",
-            transcript_path.display()
-        );
-    }
+    let Some(turns) = supported_cursor_turns(&transcript_path, &raw)? else {
+        return Ok(None);
+    };
 
     let derived_conversation_id = fallback_conversation_id(&transcript_path, &cursor_projects)
         .context("Cursor transcript path has no conversation id")?;
@@ -285,14 +392,8 @@ pub fn export_cursor_history(
     };
     let modified = fs::metadata(&transcript_path)?.modified()?;
     let timestamp: DateTime<Utc> = modified.into();
-    let output_dir = output_dir.unwrap_or_else(|| {
-        paths
-            .home
-            .join("Documents")
-            .join("Obsidian")
-            .join("sessions")
-    });
-    fs::create_dir_all(&output_dir).with_context(|| format!("create {}", output_dir.display()))?;
+    let output_dir = output_dir.unwrap_or_else(|| default_cursor_history_output_dir(paths));
+    ensure_private_history_dir(&output_dir)?;
     let output = output_dir.join(format!("cursor-{}.md", safe_filename(&conversation_id)));
     let existing = read_existing_cursor_export(&output, &conversation_id)?;
     let workspace_roots = hook
@@ -331,49 +432,120 @@ pub fn export_cursor_history(
                 .and_then(|value| value.as_str().map(ToString::to_string))
         })
         .unwrap_or_default();
+    let (safe_turns, redaction_count) = redact_turns(turns);
     let content = render_markdown(
         &conversation_id,
         timestamp,
         &model,
         &workspace_roots,
-        &turns,
+        redaction_count,
+        &safe_turns,
     )?;
 
     let changed = existing.as_deref() != Some(content.as_str());
     if changed {
         write_atomic(&output, content.as_bytes())?;
     }
-    if refresh_qmd {
-        write_qmd_pending_marker(paths, &conversation_id)?;
-    }
+    set_private_file_mode(&output)?;
     drop(export_lock);
-    if refresh_qmd {
-        refresh_qmd_index(paths, false)?;
-    }
+    refresh_qmd_after_cursor_export(paths, &output_dir, &output, refresh_qmd, changed)?;
     Ok(Some(output))
+}
+
+fn refresh_qmd_after_cursor_export(
+    paths: &AgentPaths,
+    output_dir: &Path,
+    output: &Path,
+    refresh_qmd: bool,
+    changed: bool,
+) -> Result<()> {
+    if !refresh_qmd {
+        return Ok(());
+    }
+    let refresh_needed = if changed {
+        write_qmd_pending_marker(paths, output)?;
+        true
+    } else {
+        has_pending_qmd_work(paths, output_dir)?
+    };
+    if !refresh_needed {
+        return Ok(());
+    }
+    if running_from_cursor_hook() {
+        enqueue_deferred_qmd_refresh(paths, output_dir)?;
+    } else {
+        refresh_pending_qmd_index_for_output(paths, output_dir, false)?;
+    }
+    Ok(())
 }
 
 /// Exports every readable Cursor agent transcript so a scheduled sync can
 /// recover sessions missed by the stop hook.
 pub fn sweep_cursor_history(paths: &AgentPaths, mark_qmd_pending: bool) -> Result<usize> {
+    sweep_cursor_history_to(
+        paths,
+        &default_cursor_history_output_dir(paths),
+        mark_qmd_pending,
+    )
+}
+
+pub fn sweep_cursor_history_to(
+    paths: &AgentPaths,
+    output_dir: &Path,
+    mark_qmd_pending: bool,
+) -> Result<usize> {
+    Ok(sweep_cursor_history_report_to(paths, output_dir, mark_qmd_pending)?.exported)
+}
+
+pub(crate) fn sweep_cursor_history_report_to(
+    paths: &AgentPaths,
+    output_dir: &Path,
+    mark_qmd_pending: bool,
+) -> Result<CursorHistorySweepReport> {
     let mut exported = 0;
+    let mut unreadable = Vec::new();
     for transcript in cursor_transcript_paths(paths)? {
-        let hook = json!({"transcript_path": transcript});
-        if let Some(output) = export_cursor_history(paths, &hook, None, false)? {
-            exported += 1;
-            if mark_qmd_pending {
-                let marker = output
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("cursor-history");
-                write_qmd_pending_marker(paths, marker)?;
+        let hook = json!({"transcript_path": &transcript});
+        match export_cursor_history(paths, &hook, Some(output_dir.to_path_buf()), false) {
+            Ok(Some(output)) => {
+                exported += 1;
+                if mark_qmd_pending {
+                    write_qmd_pending_marker(paths, &output)?;
+                }
             }
+            Ok(None) => {}
+            Err(error) if is_cursor_transcript_format_error(&error) => unreadable.push(transcript),
+            Err(error) => return Err(error),
         }
     }
-    Ok(exported)
+    Ok(CursorHistorySweepReport {
+        exported,
+        unreadable,
+    })
+}
+
+pub(crate) fn cursor_history_unreadable_count(paths: &AgentPaths) -> Result<usize> {
+    Ok(cursor_transcript_paths(paths)?
+        .into_iter()
+        .filter(|transcript| cursor_transcript_is_unreadable(transcript))
+        .count())
+}
+
+fn cursor_transcript_is_unreadable(transcript: &Path) -> bool {
+    match fs::read_to_string(transcript) {
+        Ok(raw) => supported_cursor_turns(transcript, &raw).is_err(),
+        Err(_) => true,
+    }
 }
 
 pub fn cursor_history_coverage(paths: &AgentPaths) -> Result<CursorHistoryCoverage> {
+    cursor_history_coverage_at(paths, &default_cursor_history_output_dir(paths))
+}
+
+pub fn cursor_history_coverage_at(
+    paths: &AgentPaths,
+    output_dir: &Path,
+) -> Result<CursorHistoryCoverage> {
     let projects = paths.cursor_home.join("projects");
     if !projects.exists() {
         return Ok(CursorHistoryCoverage {
@@ -387,7 +559,6 @@ pub fn cursor_history_coverage(paths: &AgentPaths) -> Result<CursorHistoryCovera
     let canonical_projects = projects
         .canonicalize()
         .with_context(|| format!("resolve {}", projects.display()))?;
-    let output_dir = paths.home.join("Documents/Obsidian/sessions");
     let mut expected_exports = Vec::new();
     let mut missing = Vec::new();
     let mut stale = Vec::new();
@@ -445,11 +616,13 @@ pub fn cursor_history_coverage(paths: &AgentPaths) -> Result<CursorHistoryCovera
             .and_then(|value| value.as_str().map(ToString::to_string))
             .unwrap_or_default();
         let timestamp: DateTime<Utc> = fs::metadata(&transcript)?.modified()?.into();
+        let (turns, redaction_count) = redact_turns(turns);
         let expected = render_markdown(
             &conversation_id,
             timestamp,
             &model,
             &workspace_roots,
+            redaction_count,
             &turns,
         )?;
         if content != expected {
@@ -618,6 +791,37 @@ fn ensure_cursor_hooks_write_safe(path: &Path) -> Result<()> {
     }
 }
 
+fn supported_cursor_turns(
+    transcript_path: &Path,
+    raw: &str,
+) -> Result<Option<Vec<(String, String)>>> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let turns = cursor_turns(raw).map_err(|error| CursorTranscriptFormatError {
+        message: format!(
+            "Cursor transcript {} has an unsupported entry; Cursor may have changed its transcript format: {error:#}",
+            transcript_path.display()
+        ),
+    })?;
+    if turns.is_empty() {
+        return Err(CursorTranscriptFormatError {
+            message: format!(
+                "Cursor transcript {} contains no supported user or assistant turns; Cursor may have changed its transcript format",
+                transcript_path.display()
+            ),
+        }
+        .into());
+    }
+    Ok(Some(turns))
+}
+
+fn is_cursor_transcript_format_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<CursorTranscriptFormatError>())
+}
+
 fn cursor_turns(raw: &str) -> Result<Vec<(String, String)>> {
     let mut turns = Vec::new();
     for (index, line) in raw.lines().enumerate() {
@@ -763,6 +967,7 @@ fn render_markdown(
     timestamp: DateTime<Utc>,
     model: &str,
     workspace_roots: &[String],
+    secret_redactions: usize,
     turns: &[(String, String)],
 ) -> Result<String> {
     let mut out = String::new();
@@ -773,6 +978,7 @@ fn render_markdown(
     ));
     out.push_str(&format!("date: {}\n", timestamp.to_rfc3339()));
     out.push_str(&format!("model: {}\n", serde_json::to_string(model)?));
+    out.push_str(&format!("secret_redactions: {secret_redactions}\n"));
     out.push_str(&format!(
         "workspace_roots: {}\n---\n\n",
         serde_json::to_string(workspace_roots)?
@@ -785,6 +991,19 @@ fn render_markdown(
     Ok(out)
 }
 
+fn redact_turns(turns: Vec<(String, String)>) -> (Vec<(String, String)>, usize) {
+    let mut redaction_count = 0;
+    let turns = turns
+        .into_iter()
+        .map(|(role, text)| {
+            let (text, count) = redact_known_secrets(&text);
+            redaction_count += count;
+            (role, text)
+        })
+        .collect();
+    (turns, redaction_count)
+}
+
 fn is_managed_hook(entry: &Value) -> bool {
     let Some(command) = entry
         .get("command")
@@ -793,7 +1012,7 @@ fn is_managed_hook(entry: &Value) -> bool {
     else {
         return false;
     };
-    [
+    let legacy = [
         MANAGED_HOOK_COMMAND_SUFFIX,
         MANAGED_HOOK_SKIP_QMD_COMMAND_SUFFIX,
     ]
@@ -802,10 +1021,44 @@ fn is_managed_hook(entry: &Value) -> bool {
         command
             .strip_suffix(suffix)
             .is_some_and(|executable| !executable.is_empty())
-    })
+    });
+    let current = command.ends_with(MANAGED_HOOK_V1_SUFFIX)
+        && command.contains(" cursor-history export --output-dir ");
+    legacy || current
 }
 
 pub fn refresh_qmd_index(paths: &AgentPaths, force: bool) -> Result<bool> {
+    refresh_qmd_index_for_output(paths, &default_cursor_history_output_dir(paths), force)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QmdVerificationScope {
+    Full,
+    Pending,
+}
+
+pub fn refresh_qmd_index_for_output(
+    paths: &AgentPaths,
+    output_dir: &Path,
+    force: bool,
+) -> Result<bool> {
+    refresh_qmd_index_for_output_with_scope(paths, output_dir, force, QmdVerificationScope::Full)
+}
+
+pub(crate) fn refresh_pending_qmd_index_for_output(
+    paths: &AgentPaths,
+    output_dir: &Path,
+    force: bool,
+) -> Result<bool> {
+    refresh_qmd_index_for_output_with_scope(paths, output_dir, force, QmdVerificationScope::Pending)
+}
+
+fn refresh_qmd_index_for_output_with_scope(
+    paths: &AgentPaths,
+    output_dir: &Path,
+    force: bool,
+    scope: QmdVerificationScope,
+) -> Result<bool> {
     let mut waits = 0;
     let _lock = loop {
         if let Some(lock) = acquire_qmd_refresh_lock(paths)? {
@@ -820,14 +1073,17 @@ pub fn refresh_qmd_index(paths: &AgentPaths, force: bool) -> Result<bool> {
         waits += 1;
         std::thread::sleep(QMD_REFRESH_LOCK_WAIT);
     };
-    let refresh_started = SystemTime::now();
+    let pending_work = pending_qmd_work(paths, output_dir)?;
+    if scope == QmdVerificationScope::Pending && pending_work.markers.is_empty() {
+        return Ok(false);
+    }
 
     let qmd = qmd_executable(paths).context("QMD executable was not found in a standard path")?;
     run_qmd_command(&qmd, "update")?;
     run_qmd_command(&qmd, "embed")?;
 
     let health = qmd_health(paths)?;
-    let expected_sessions = paths.home.join("Documents/Obsidian/sessions");
+    let expected_sessions = output_dir.to_path_buf();
     let actual_sessions =
         fs::canonicalize(&health.sessions_path).unwrap_or_else(|_| health.sessions_path.clone());
     let expected_sessions = fs::canonicalize(&expected_sessions).unwrap_or(expected_sessions);
@@ -838,44 +1094,197 @@ pub fn refresh_qmd_index(paths: &AgentPaths, force: bool) -> Result<bool> {
             expected_sessions.display()
         );
     }
-    if health.pending_embeddings > 0 {
-        anyhow::bail!(
-            "QMD still has {} pending embedding(s) after refresh",
-            health.pending_embeddings
-        );
-    }
-
-    let coverage = cursor_history_coverage(paths)?;
-    if !coverage.is_complete() {
-        anyhow::bail!(
-            "Cursor history coverage is incomplete after refresh: {} missing, {} stale, {} unreadable",
-            coverage.missing.len(),
-            coverage.stale.len(),
-            coverage.unreadable.len()
-        );
-    }
-    for export in &coverage.expected_exports {
-        if !qmd_export_is_indexed(paths, export)? {
+    let exports = if scope == QmdVerificationScope::Full || pending_work.has_legacy_marker {
+        let coverage = cursor_history_coverage_at(paths, output_dir)?;
+        if !coverage.is_complete() {
             anyhow::bail!(
-                "Cursor history export is not retrievable from QMD: {}",
-                export.display()
+                "Cursor history coverage is incomplete after refresh: {} missing, {} stale, {} unreadable",
+                coverage.missing.len(),
+                coverage.stale.len(),
+                coverage.unreadable.len()
             );
         }
+        coverage.expected_exports
+    } else {
+        pending_work.exports.clone()
+    };
+    let missing = qmd_missing_exports(paths, &exports)?;
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "{} Cursor history export(s) are not retrievable from QMD: {}",
+            missing.len(),
+            missing
+                .iter()
+                .map(|export| export.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     write_qmd_refresh_state(paths, SystemTime::now())?;
-    clear_qmd_pending_markers(paths, refresh_started)?;
+    clear_qmd_pending_markers(&pending_work.markers)?;
     Ok(true)
 }
 
 pub fn qmd_executable(paths: &AgentPaths) -> Option<PathBuf> {
-    [
+    let fixed = [
         paths.home.join(".local/bin/qmd"),
         PathBuf::from("/usr/local/bin/qmd"),
         PathBuf::from("/opt/homebrew/bin/qmd"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+    ];
+    fixed.into_iter().find(|path| path.is_file()).or_else(|| {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .map(|directory| directory.join("qmd"))
+            .find(|path| path.is_file())
+    })
+}
+
+pub fn default_cursor_history_output_dir(paths: &AgentPaths) -> PathBuf {
+    paths.home.join(".agent-sync/history/cursor")
+}
+
+fn ensure_private_history_dir(path: &Path) -> Result<()> {
+    ensure_dir(path)?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect Cursor history directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "Cursor history path is not a private regular directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("protect Cursor history directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn set_private_file_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("protect Cursor history export {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn running_from_cursor_hook() -> bool {
+    std::env::var_os("AGENT_SYNC_CURSOR_HISTORY_HOOK").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+pub fn enqueue_deferred_qmd_refresh(paths: &AgentPaths, output_dir: &Path) -> Result<bool> {
+    let state_dir = qmd_refresh_state_dir(paths);
+    ensure_dir(&state_dir)?;
+    let reservation_path = state_dir.join("qmd-refresh-deferred.lock");
+    for _ in 0..2 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&reservation_path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "deferred:{}", unix_millis(SystemTime::now())?)
+                    .with_context(|| format!("write {}", reservation_path.display()))?;
+                file.sync_all()?;
+                let snapshot = read_lock_snapshot(&reservation_path)?.with_context(|| {
+                    format!(
+                        "deferred QMD reservation changed at {}",
+                        reservation_path.display()
+                    )
+                })?;
+                if let Err(error) = spawn_qmd_refresh_process(paths, output_dir) {
+                    let cleanup = remove_lock_if_snapshot_matches(&reservation_path, &snapshot);
+                    if let Err(cleanup_error) = cleanup {
+                        anyhow::bail!(
+                            "start deferred QMD refresh failed: {error:#}; reservation cleanup also failed: {cleanup_error:#}"
+                        );
+                    }
+                    return Err(error);
+                }
+                return Ok(true);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let Some(snapshot) = read_lock_snapshot(&reservation_path)? else {
+                    continue;
+                };
+                let age = SystemTime::now()
+                    .duration_since(snapshot.identity.modified)
+                    .unwrap_or_default();
+                if age > QMD_REFRESH_LOCK_STALE_AFTER {
+                    remove_lock_if_snapshot_matches(&reservation_path, &snapshot)?;
+                    continue;
+                }
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create {}", reservation_path.display()));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn spawn_qmd_refresh_process(paths: &AgentPaths, output_dir: &Path) -> Result<()> {
+    let executable = std::env::current_exe().context("resolve agent-sync executable")?;
+    let mut command = Command::new(executable);
+    for (flag, path) in [
+        ("--home", paths.home.as_path()),
+        ("--codex-home", paths.codex_home.as_path()),
+        ("--claude-home", paths.claude_home.as_path()),
+        ("--claude-config", paths.claude_config.as_path()),
+        ("--cursor-home", paths.cursor_home.as_path()),
+        ("--cursor-config", paths.cursor_config.as_path()),
+        ("--agents-home", paths.agents_home.as_path()),
+    ] {
+        command.arg(flag).arg(path);
+    }
+    command
+        .args(["cursor-history", "refresh-qmd", "--output-dir"])
+        .arg(output_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("AGENT_SYNC_CURSOR_HISTORY_HOOK")
+        .spawn()
+        .context("start deferred QMD refresh")?;
+    Ok(())
+}
+
+pub fn run_deferred_qmd_refresh(paths: &AgentPaths, output_dir: &Path) -> Result<bool> {
+    let reservation_path = qmd_refresh_state_dir(paths).join("qmd-refresh-deferred.lock");
+    let Some(snapshot) = read_lock_snapshot(&reservation_path)? else {
+        return Ok(false);
+    };
+    let reservation = DeferredRefreshReservation {
+        path: reservation_path,
+        snapshot,
+    };
+    std::thread::sleep(QMD_DEFERRED_REFRESH_DELAY);
+    let refreshed = refresh_pending_qmd_index_for_output(paths, output_dir, false)?;
+    let still_pending = has_pending_qmd_work(paths, output_dir)?;
+    drop(reservation);
+    if still_pending {
+        enqueue_deferred_qmd_refresh(paths, output_dir)?;
+    }
+    Ok(refreshed)
+}
+
+struct DeferredRefreshReservation {
+    path: PathBuf,
+    snapshot: LockSnapshot,
+}
+
+impl Drop for DeferredRefreshReservation {
+    fn drop(&mut self) {
+        let _ = remove_lock_if_snapshot_matches(&self.path, &self.snapshot);
+    }
 }
 
 pub fn qmd_refresh_last_success(paths: &AgentPaths) -> Result<Option<DateTime<Utc>>> {
@@ -914,12 +1323,12 @@ pub fn qmd_pending_exports(paths: &AgentPaths) -> Result<usize> {
 pub fn qmd_health(paths: &AgentPaths) -> Result<QmdHealth> {
     let qmd = qmd_executable(paths).context("QMD executable was not found in a standard path")?;
     let collection = Command::new(&qmd)
-        .args(["collection", "show", "sessions"])
+        .args(["collection", "show", QMD_CURSOR_COLLECTION])
         .output()
-        .context("run qmd collection show sessions")?;
+        .context("inspect the agent-sync QMD collection")?;
     if !collection.status.success() {
         anyhow::bail!(
-            "qmd sessions collection check failed with {}: {}",
+            "QMD collection {QMD_CURSOR_COLLECTION:?} check failed with {}: {}",
             collection.status,
             String::from_utf8_lossy(&collection.stderr).trim()
         );
@@ -932,26 +1341,26 @@ pub fn qmd_health(paths: &AgentPaths) -> Result<QmdHealth> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .context("qmd sessions collection output has no path")?;
+        .context("agent-sync QMD collection output has no path")?;
     let sessions_pattern = collection_stdout
         .lines()
         .find_map(|line| line.trim().strip_prefix("Pattern:"))
         .map(str::trim)
         .filter(|pattern| !pattern.is_empty())
         .map(ToString::to_string)
-        .context("qmd sessions collection output has no pattern")?;
+        .context("agent-sync QMD collection output has no pattern")?;
     let sessions_included = collection_stdout
         .lines()
         .find_map(|line| line.trim().strip_prefix("Include:"))
         .map(str::trim)
         .map(|include| include.to_ascii_lowercase().starts_with("yes"))
-        .context("qmd sessions collection output has no include state")?;
+        .context("agent-sync QMD collection output has no include state")?;
     if !sessions_included {
-        anyhow::bail!("QMD sessions collection is excluded from global search");
+        anyhow::bail!("agent-sync QMD collection is excluded from global search");
     }
     if !qmd_pattern_covers_cursor_exports(&sessions_pattern) {
         anyhow::bail!(
-            "QMD sessions collection pattern {sessions_pattern:?} does not cover cursor-*.md"
+            "agent-sync QMD collection pattern {sessions_pattern:?} does not cover cursor-*.md"
         );
     }
 
@@ -975,6 +1384,56 @@ pub fn qmd_health(paths: &AgentPaths) -> Result<QmdHealth> {
         sessions_included,
         pending_embeddings,
     })
+}
+
+pub fn ensure_qmd_collection(paths: &AgentPaths, dry_run: bool) -> Result<bool> {
+    let qmd = qmd_executable(paths).context("QMD executable was not found in a standard path")?;
+    let output_dir = default_cursor_history_output_dir(paths);
+    let inspection = Command::new(&qmd)
+        .args(["collection", "show", QMD_CURSOR_COLLECTION])
+        .output()
+        .context("inspect the agent-sync QMD collection")?;
+    if inspection.status.success() {
+        let health = qmd_health(paths)?;
+        let actual = fs::canonicalize(&health.sessions_path).unwrap_or(health.sessions_path);
+        let expected = fs::canonicalize(&output_dir).unwrap_or(output_dir);
+        if actual != expected {
+            anyhow::bail!(
+                "QMD collection {QMD_CURSOR_COLLECTION:?} points to {}, expected {}",
+                actual.display(),
+                expected.display()
+            );
+        }
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&inspection.stderr);
+    if !stderr.contains("Collection not found") {
+        anyhow::bail!(
+            "inspect QMD collection {QMD_CURSOR_COLLECTION:?} failed with {}: {}",
+            inspection.status,
+            stderr.trim()
+        );
+    }
+    if dry_run {
+        return Ok(true);
+    }
+
+    ensure_private_history_dir(&output_dir)?;
+    let created = Command::new(qmd)
+        .args(["collection", "add"])
+        .arg(&output_dir)
+        .args(["--name", QMD_CURSOR_COLLECTION])
+        .output()
+        .context("create the agent-sync QMD collection")?;
+    if !created.status.success() {
+        anyhow::bail!(
+            "create QMD collection {QMD_CURSOR_COLLECTION:?} failed with {}: {}",
+            created.status,
+            String::from_utf8_lossy(&created.stderr).trim()
+        );
+    }
+    qmd_health(paths)?;
+    Ok(true)
 }
 
 fn parse_qmd_pending_embeddings(status: &str) -> Result<usize> {
@@ -1021,115 +1480,213 @@ fn qmd_pattern_covers_cursor_exports(patterns: &str) -> bool {
 }
 
 fn glob_matches(pattern: &[u8], candidate: &[u8]) -> bool {
-    fn matches_from(
-        pattern: &[u8],
-        candidate: &[u8],
-        pattern_index: usize,
-        candidate_index: usize,
-        memo: &mut [Vec<Option<bool>>],
-    ) -> bool {
-        if let Some(result) = memo[pattern_index][candidate_index] {
+    GlobMatcher::new(pattern, candidate).matches_from(0, 0)
+}
+
+struct GlobMatcher<'a> {
+    pattern: &'a [u8],
+    candidate: &'a [u8],
+    memo: Vec<Vec<Option<bool>>>,
+}
+
+impl<'a> GlobMatcher<'a> {
+    fn new(pattern: &'a [u8], candidate: &'a [u8]) -> Self {
+        Self {
+            pattern,
+            candidate,
+            memo: vec![vec![None; candidate.len() + 1]; pattern.len() + 1],
+        }
+    }
+
+    fn matches_from(&mut self, pattern_index: usize, candidate_index: usize) -> bool {
+        if let Some(result) = self.memo[pattern_index][candidate_index] {
             return result;
         }
-        let result = if pattern_index == pattern.len() {
-            candidate_index == candidate.len()
-        } else if pattern[pattern_index] == b'*' && pattern.get(pattern_index + 1) == Some(&b'*') {
-            let mut next = pattern_index + 2;
-            while pattern.get(next) == Some(&b'*') {
-                next += 1;
-            }
-            if pattern.get(next) == Some(&b'/') {
-                matches_from(pattern, candidate, next + 1, candidate_index, memo)
-                    || (candidate_index < candidate.len()
-                        && matches_from(
-                            pattern,
-                            candidate,
-                            pattern_index,
-                            candidate_index + 1,
-                            memo,
-                        ))
-            } else {
-                matches_from(pattern, candidate, next, candidate_index, memo)
-                    || (candidate_index < candidate.len()
-                        && matches_from(
-                            pattern,
-                            candidate,
-                            pattern_index,
-                            candidate_index + 1,
-                            memo,
-                        ))
-            }
-        } else if pattern[pattern_index] == b'*' {
-            matches_from(pattern, candidate, pattern_index + 1, candidate_index, memo)
-                || (candidate_index < candidate.len()
-                    && candidate[candidate_index] != b'/'
-                    && matches_from(pattern, candidate, pattern_index, candidate_index + 1, memo))
-        } else if candidate_index < candidate.len()
-            && (pattern[pattern_index] == b'?'
-                || pattern[pattern_index] == candidate[candidate_index])
-        {
-            matches_from(
-                pattern,
-                candidate,
-                pattern_index + 1,
-                candidate_index + 1,
-                memo,
-            )
-        } else {
-            false
-        };
-        memo[pattern_index][candidate_index] = Some(result);
+        let result = self.match_uncached(pattern_index, candidate_index);
+        self.memo[pattern_index][candidate_index] = Some(result);
         result
     }
 
-    let mut memo = vec![vec![None; candidate.len() + 1]; pattern.len() + 1];
-    matches_from(pattern, candidate, 0, 0, &mut memo)
+    fn match_uncached(&mut self, pattern_index: usize, candidate_index: usize) -> bool {
+        let Some(pattern_byte) = self.pattern.get(pattern_index).copied() else {
+            return candidate_index == self.candidate.len();
+        };
+        match pattern_byte {
+            b'*' if self.pattern.get(pattern_index + 1) == Some(&b'*') => {
+                self.match_double_star(pattern_index, candidate_index)
+            }
+            b'*' => {
+                self.match_zero_or_more(pattern_index + 1, pattern_index, candidate_index, false)
+            }
+            _ => self.match_single_character(pattern_index, candidate_index, pattern_byte),
+        }
+    }
+
+    fn match_double_star(&mut self, pattern_index: usize, candidate_index: usize) -> bool {
+        let mut next = pattern_index + 2;
+        while self.pattern.get(next) == Some(&b'*') {
+            next += 1;
+        }
+        if self.pattern.get(next) == Some(&b'/') {
+            next += 1;
+        }
+        self.match_zero_or_more(next, pattern_index, candidate_index, true)
+    }
+
+    fn match_zero_or_more(
+        &mut self,
+        skip_pattern_index: usize,
+        repeat_pattern_index: usize,
+        candidate_index: usize,
+        allow_slash: bool,
+    ) -> bool {
+        self.matches_from(skip_pattern_index, candidate_index)
+            || (self.can_consume(candidate_index, allow_slash)
+                && self.matches_from(repeat_pattern_index, candidate_index + 1))
+    }
+
+    fn can_consume(&self, candidate_index: usize, allow_slash: bool) -> bool {
+        self.candidate
+            .get(candidate_index)
+            .is_some_and(|candidate| allow_slash || *candidate != b'/')
+    }
+
+    fn match_single_character(
+        &mut self,
+        pattern_index: usize,
+        candidate_index: usize,
+        pattern_byte: u8,
+    ) -> bool {
+        let Some(candidate_byte) = self.candidate.get(candidate_index) else {
+            return false;
+        };
+        if pattern_byte != b'?' && pattern_byte != *candidate_byte {
+            return false;
+        }
+        self.matches_from(pattern_index + 1, candidate_index + 1)
+    }
+}
+
+#[derive(Debug)]
+struct QmdExportLookup {
+    export: PathBuf,
+    virtual_path: String,
+    body: String,
+}
+
+pub fn qmd_missing_exports(paths: &AgentPaths, exports: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if exports.is_empty() {
+        return Ok(Vec::new());
+    }
+    let qmd = qmd_executable(paths).context("QMD executable was not found in a standard path")?;
+    let mut missing = Vec::new();
+    let mut chunk = Vec::new();
+    let mut chunk_body_bytes = 0_u64;
+
+    for export in exports {
+        let lookup = prepare_qmd_export_lookup(export)?;
+        let body_bytes = lookup.body.len() as u64;
+        if !chunk.is_empty()
+            && (chunk.len() >= QMD_EXACT_LOOKUP_MAX_EXPORTS
+                || chunk_body_bytes.saturating_add(body_bytes) > QMD_EXACT_LOOKUP_MAX_BODY_BYTES)
+        {
+            collect_missing_qmd_exports(&qmd, &chunk, &mut missing)?;
+            chunk.clear();
+            chunk_body_bytes = 0;
+        }
+        chunk_body_bytes = chunk_body_bytes.saturating_add(body_bytes);
+        chunk.push(lookup);
+    }
+    if !chunk.is_empty() {
+        collect_missing_qmd_exports(&qmd, &chunk, &mut missing)?;
+    }
+    Ok(missing)
 }
 
 pub fn qmd_export_is_indexed(paths: &AgentPaths, export: &Path) -> Result<bool> {
-    let qmd = qmd_executable(paths).context("QMD executable was not found in a standard path")?;
+    Ok(qmd_missing_exports(paths, &[export.to_path_buf()])?.is_empty())
+}
+
+fn prepare_qmd_export_lookup(export: &Path) -> Result<QmdExportLookup> {
+    let metadata = fs::symlink_metadata(export)
+        .with_context(|| format!("inspect Cursor history export {}", export.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "Cursor history export is not a regular file: {}",
+            export.display()
+        );
+    }
     let name = export
         .file_name()
         .and_then(|name| name.to_str())
         .context("Cursor history export has no UTF-8 file name")?;
-    let virtual_path = format!("qmd://sessions/{name}");
-    let max_bytes = fs::metadata(export)
-        .with_context(|| format!("inspect Cursor history export {}", export.display()))?
-        .len()
-        .saturating_add(4_096);
+    let body = fs::read_to_string(export)
+        .with_context(|| format!("read Cursor history export {}", export.display()))?;
+    Ok(QmdExportLookup {
+        export: export.to_path_buf(),
+        virtual_path: format!("qmd://{QMD_CURSOR_COLLECTION}/{name}"),
+        body,
+    })
+}
+
+fn collect_missing_qmd_exports(
+    qmd: &Path,
+    chunk: &[QmdExportLookup],
+    missing: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let mut exact_paths = chunk
+        .iter()
+        .map(|lookup| lookup.virtual_path.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
     // The trailing comma intentionally selects QMD's exact-path list mode.
-    // Without it, multi-get treats a single path as a glob and can suffix-match
-    // another document with the same basename.
+    exact_paths.push(',');
+    let max_bytes = chunk
+        .iter()
+        .map(|lookup| lookup.body.len() as u64)
+        .max()
+        .unwrap_or_default()
+        .saturating_add(4_096);
     let output = Command::new(qmd)
         .args([
             "multi-get",
-            &format!("{virtual_path},"),
+            &exact_paths,
             "--json",
             "--max-bytes",
             &max_bytes.to_string(),
         ])
         .output()
-        .with_context(|| format!("check QMD index for {}", export.display()))?;
+        .context("check exact Cursor history exports in QMD")?;
     if !output.status.success() {
-        return Ok(false);
+        missing.extend(chunk.iter().map(|lookup| lookup.export.clone()));
+        return Ok(());
     }
     let indexed: Value = serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("parse indexed QMD export {}", export.display()))?;
-    let current = fs::read_to_string(export)
-        .with_context(|| format!("read Cursor history export {}", export.display()))?;
+        .context("parse exact Cursor history exports returned by QMD")?;
     let Some(documents) = indexed.as_array() else {
         anyhow::bail!("qmd multi-get did not return a JSON array");
     };
-    if documents.len() != 1 {
-        return Ok(false);
+    let documents_by_path = documents
+        .iter()
+        .filter_map(|document| {
+            document
+                .get("file")
+                .and_then(Value::as_str)
+                .map(|path| (path, document))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for lookup in chunk {
+        let indexed_body = documents_by_path
+            .get(lookup.virtual_path.as_str())
+            .and_then(|document| document.get("body"))
+            .and_then(Value::as_str);
+        if !indexed_body.is_some_and(|body| {
+            body.trim_end_matches(['\r', '\n']) == lookup.body.trim_end_matches(['\r', '\n'])
+        }) {
+            missing.push(lookup.export.clone());
+        }
     }
-    let document = &documents[0];
-    let exact_path = document.get("file").and_then(Value::as_str) == Some(&virtual_path);
-    let body = document.get("body").and_then(Value::as_str);
-    Ok(exact_path
-        && body.is_some_and(|body| {
-            body.trim_end_matches(['\r', '\n']) == current.trim_end_matches(['\r', '\n'])
-        }))
+    Ok(())
 }
 
 fn run_qmd_command(qmd: &Path, subcommand: &str) -> Result<()> {
@@ -1203,41 +1760,68 @@ impl LockFileIdentity {
 }
 
 fn acquire_cursor_history_export_lock(paths: &AgentPaths) -> Result<CursorHistoryExportLock> {
-    let state_dir = qmd_refresh_state_dir(paths);
-    ensure_dir(&state_dir)?;
-    let path = state_dir.join("cursor-history-export.lock");
+    let path = cursor_history_export_lock_path(paths)?;
     let mut waits = 0;
     loop {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                let token = format!("{}:{}", std::process::id(), unix_millis(SystemTime::now())?);
-                writeln!(file, "{token}")
-                    .with_context(|| format!("write Cursor history lock {}", path.display()))?;
-                file.sync_all()?;
-                let snapshot = read_lock_snapshot(&path)?.with_context(|| {
-                    format!(
-                        "Cursor history lock changed while acquiring {}",
-                        path.display()
-                    )
-                })?;
-                return Ok(CursorHistoryExportLock { path, snapshot });
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                if remove_stale_lock_if_unchanged(&path)? {
-                    continue;
-                }
-                if waits >= CURSOR_EXPORT_LOCK_MAX_WAITS {
-                    anyhow::bail!("timed out waiting for Cursor history export lock");
-                }
-                waits += 1;
-                std::thread::sleep(QMD_REFRESH_LOCK_WAIT);
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("create Cursor history lock {}", path.display()));
-            }
+        if let Some(lock) = create_cursor_history_export_lock(&path)? {
+            return Ok(lock);
         }
+        if remove_stale_lock_if_unchanged(&path)? {
+            continue;
+        }
+        if waits >= CURSOR_EXPORT_LOCK_MAX_WAITS {
+            anyhow::bail!("timed out waiting for Cursor history export lock");
+        }
+        waits += 1;
+        std::thread::sleep(QMD_REFRESH_LOCK_WAIT);
     }
+}
+
+fn acquire_cursor_history_export_lock_for_mode(
+    paths: &AgentPaths,
+    mode: CursorHistoryLockMode,
+) -> Result<Option<CursorHistoryExportLock>> {
+    match mode {
+        CursorHistoryLockMode::Wait => Ok(Some(acquire_cursor_history_export_lock(paths)?)),
+        CursorHistoryLockMode::SkipIfBusy => try_acquire_cursor_history_export_lock(paths),
+    }
+}
+
+fn try_acquire_cursor_history_export_lock(
+    paths: &AgentPaths,
+) -> Result<Option<CursorHistoryExportLock>> {
+    create_cursor_history_export_lock(&cursor_history_export_lock_path(paths)?)
+}
+
+fn cursor_history_export_lock_path(paths: &AgentPaths) -> Result<PathBuf> {
+    let state_dir = qmd_refresh_state_dir(paths);
+    ensure_dir(&state_dir)?;
+    Ok(state_dir.join("cursor-history-export.lock"))
+}
+
+fn create_cursor_history_export_lock(path: &Path) -> Result<Option<CursorHistoryExportLock>> {
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("create Cursor history lock {}", path.display()))
+        }
+    };
+    let token = format!("{}:{}", std::process::id(), unix_millis(SystemTime::now())?);
+    writeln!(file, "{token}")
+        .with_context(|| format!("write Cursor history lock {}", path.display()))?;
+    file.sync_all()?;
+    let snapshot = read_lock_snapshot(path)?.with_context(|| {
+        format!(
+            "Cursor history lock changed while acquiring {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(CursorHistoryExportLock {
+        path: path.to_path_buf(),
+        snapshot,
+    }))
 }
 
 fn acquire_qmd_refresh_lock(paths: &AgentPaths) -> Result<Option<QmdRefreshLock>> {
@@ -1335,7 +1919,10 @@ fn remove_stale_lock_if_unchanged(path: &Path) -> Result<bool> {
     let Some(snapshot) = read_lock_snapshot(path)? else {
         return Ok(true);
     };
-    if lock_owner_is_active(&snapshot.token) || !lock_snapshot_is_stale(&snapshot)? {
+    let age = lock_snapshot_age(&snapshot)?;
+    let hard_expired = age.is_some_and(|age| age >= PERSISTENT_LOCK_HARD_MAX_AGE);
+    let normally_stale = age.is_some_and(|age| age >= QMD_REFRESH_LOCK_STALE_AFTER);
+    if !hard_expired && (lock_owner_is_active(&snapshot.token) || !normally_stale) {
         return Ok(false);
     }
     remove_lock_if_snapshot_matches(path, &snapshot)
@@ -1355,15 +1942,19 @@ fn remove_lock_if_snapshot_matches(path: &Path, expected: &LockSnapshot) -> Resu
     }
 }
 
-fn lock_snapshot_is_stale(snapshot: &LockSnapshot) -> Result<bool> {
+fn lock_snapshot_age(snapshot: &LockSnapshot) -> Result<Option<Duration>> {
     let now = unix_millis(SystemTime::now())?;
     let token_age = snapshot
         .token
         .split_once(':')
         .and_then(|(_, timestamp)| timestamp.parse::<u64>().ok())
         .map(|timestamp| Duration::from_millis(now.saturating_sub(timestamp)));
-    let age = token_age.or_else(|| snapshot.identity.modified.elapsed().ok());
-    Ok(age.is_some_and(|age| age >= QMD_REFRESH_LOCK_STALE_AFTER))
+    let modified_age = snapshot.identity.modified.elapsed().ok();
+    Ok(match (token_age, modified_age) {
+        (Some(token), Some(modified)) => Some(token.max(modified)),
+        (Some(age), None) | (None, Some(age)) => Some(age),
+        (None, None) => None,
+    })
 }
 
 #[cfg(unix)]
@@ -1400,38 +1991,104 @@ fn write_qmd_refresh_state(paths: &AgentPaths, now: SystemTime) -> Result<()> {
     write_atomic(&state_path, &content)
 }
 
-fn write_qmd_pending_marker(paths: &AgentPaths, conversation_id: &str) -> Result<()> {
+#[derive(Clone, Debug)]
+struct PendingQmdMarker {
+    path: PathBuf,
+    snapshot: LockSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct PendingQmdWork {
+    markers: Vec<PendingQmdMarker>,
+    exports: Vec<PathBuf>,
+    has_legacy_marker: bool,
+}
+
+#[derive(Debug)]
+enum PendingQmdTarget {
+    Legacy,
+    Export(PathBuf),
+}
+
+fn write_qmd_pending_marker(paths: &AgentPaths, export: &Path) -> Result<()> {
     let timestamp = unix_millis(SystemTime::now())?;
-    let sequence = QMD_PENDING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let export = export
+        .canonicalize()
+        .with_context(|| format!("resolve Cursor history export {}", export.display()))?;
+    validate_pending_export_path(&export)?;
+    let export_path = export.to_str().with_context(|| {
+        format!(
+            "Cursor history export path is not valid UTF-8: {}",
+            export.display()
+        )
+    })?;
     let pending =
         checked_qmd_pending_dir(paths, true)?.context("QMD pending directory was not created")?;
     let path = pending.join(format!(
-        "{QMD_PENDING_MARKER_PREFIX}{}-{timestamp}-{}-{sequence}{QMD_PENDING_MARKER_SUFFIX}",
-        safe_filename(conversation_id),
-        std::process::id()
+        "{QMD_PENDING_MARKER_PREFIX}{}{QMD_PENDING_MARKER_SUFFIX}",
+        hash_bytes(export_path.as_bytes())
     ));
-    write_atomic(
-        &path,
-        format!("{QMD_PENDING_MARKER_MAGIC}\n{timestamp}\n").as_bytes(),
-    )
+    let content = [
+        serde_json::to_vec_pretty(&json!({
+            "magic": QMD_PENDING_MARKER_MAGIC_V2,
+            "timestampUnixMillis": timestamp,
+            "exportPath": export_path,
+        }))?,
+        b"\n".to_vec(),
+    ]
+    .concat();
+    write_atomic(&path, &content)?;
+    set_private_file_mode(&path)
 }
 
-fn clear_qmd_pending_markers(paths: &AgentPaths, refresh_started: SystemTime) -> Result<()> {
+fn has_pending_qmd_work(paths: &AgentPaths, output_dir: &Path) -> Result<bool> {
+    Ok(!pending_qmd_work(paths, output_dir)?.markers.is_empty())
+}
+
+fn pending_qmd_work(paths: &AgentPaths, output_dir: &Path) -> Result<PendingQmdWork> {
     let Some(pending) = checked_qmd_pending_dir(paths, false)? else {
-        return Ok(());
+        return Ok(PendingQmdWork::default());
     };
+    let expected_output_dir = output_dir
+        .canonicalize()
+        .unwrap_or_else(|_| output_dir.to_path_buf());
+    let mut work = PendingQmdWork::default();
+    let mut exports = BTreeSet::new();
     for entry in fs::read_dir(&pending).with_context(|| format!("read {}", pending.display()))? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() || !is_managed_qmd_pending_marker(&entry.path())? {
+        if !entry.file_type()?.is_file() || !has_managed_qmd_pending_name(&entry.path()) {
             continue;
         }
         let path = entry.path();
         let Some(snapshot) = read_lock_snapshot(&path)? else {
             continue;
         };
-        if snapshot.identity.modified <= refresh_started {
-            remove_lock_if_snapshot_matches(&path, &snapshot)?;
+        match parse_qmd_pending_target(&snapshot.token, &path)? {
+            PendingQmdTarget::Legacy => {
+                work.has_legacy_marker = true;
+                work.markers.push(PendingQmdMarker { path, snapshot });
+            }
+            PendingQmdTarget::Export(export) => {
+                let parent = export
+                    .parent()
+                    .context("managed QMD pending export has no parent directory")?;
+                let parent = parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf());
+                if parent == expected_output_dir {
+                    exports.insert(export);
+                    work.markers.push(PendingQmdMarker { path, snapshot });
+                }
+            }
         }
+    }
+    work.exports = exports.into_iter().collect();
+    Ok(work)
+}
+
+fn clear_qmd_pending_markers(markers: &[PendingQmdMarker]) -> Result<()> {
+    for marker in markers {
+        remove_lock_if_snapshot_matches(&marker.path, &marker.snapshot)?;
     }
     Ok(())
 }
@@ -1446,7 +2103,10 @@ fn checked_qmd_pending_dir(paths: &AgentPaths, create: bool) -> Result<Option<Pa
         Ok(metadata) if !metadata.is_dir() => {
             anyhow::bail!("QMD pending path is not a directory: {}", pending.display())
         }
-        Ok(_) => Ok(Some(pending)),
+        Ok(_) => {
+            protect_qmd_pending_dir(&pending)?;
+            Ok(Some(pending))
+        }
         Err(error) if error.kind() == ErrorKind::NotFound && create => {
             ensure_dir(&pending)?;
             let metadata = fs::symlink_metadata(&pending)
@@ -1457,6 +2117,7 @@ fn checked_qmd_pending_dir(paths: &AgentPaths, create: bool) -> Result<Option<Pa
                     pending.display()
                 );
             }
+            protect_qmd_pending_dir(&pending)?;
             Ok(Some(pending))
         }
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -1464,35 +2125,87 @@ fn checked_qmd_pending_dir(paths: &AgentPaths, create: bool) -> Result<Option<Pa
     }
 }
 
+fn protect_qmd_pending_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("protect QMD pending directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn is_managed_qmd_pending_marker(path: &Path) -> Result<bool> {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    if !has_managed_qmd_pending_name(path) {
+        return Ok(false);
+    }
+    let Some(snapshot) = read_lock_snapshot(path)? else {
         return Ok(false);
     };
-    if !name.starts_with(QMD_PENDING_MARKER_PREFIX) || !name.ends_with(QMD_PENDING_MARKER_SUFFIX) {
-        return Ok(false);
+    parse_qmd_pending_target(&snapshot.token, path)?;
+    Ok(true)
+}
+
+fn has_managed_qmd_pending_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(QMD_PENDING_MARKER_PREFIX) && name.ends_with(QMD_PENDING_MARKER_SUFFIX)
+        })
+}
+
+fn parse_qmd_pending_target(content: &str, marker: &Path) -> Result<PendingQmdTarget> {
+    if content.lines().next() == Some(QMD_PENDING_MARKER_MAGIC_V1) {
+        let mut lines = content.lines();
+        lines.next();
+        let timestamp = lines
+            .next()
+            .context("managed QMD pending marker has no timestamp")?;
+        timestamp.parse::<u64>().with_context(|| {
+            format!("parse QMD pending marker timestamp in {}", marker.display())
+        })?;
+        if lines.next().is_some() {
+            anyhow::bail!(
+                "managed QMD pending marker has extra data: {}",
+                marker.display()
+            );
+        }
+        return Ok(PendingQmdTarget::Legacy);
     }
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read QMD pending marker {}", path.display()))?;
-    let mut lines = content.lines();
-    if lines.next() != Some(QMD_PENDING_MARKER_MAGIC) {
+
+    let value: Value = serde_json::from_str(content)
+        .with_context(|| format!("parse managed QMD pending marker {}", marker.display()))?;
+    if value.get("magic").and_then(Value::as_str) != Some(QMD_PENDING_MARKER_MAGIC_V2) {
         anyhow::bail!(
             "managed QMD pending marker is malformed: {}",
-            path.display()
+            marker.display()
         );
     }
-    let timestamp = lines
-        .next()
+    value
+        .get("timestampUnixMillis")
+        .and_then(Value::as_u64)
         .context("managed QMD pending marker has no timestamp")?;
-    timestamp
-        .parse::<u64>()
-        .with_context(|| format!("parse QMD pending marker timestamp in {}", path.display()))?;
-    if lines.next().is_some() {
+    let export = value
+        .get("exportPath")
+        .and_then(Value::as_str)
+        .context("managed QMD pending marker has no export path")?;
+    let export = PathBuf::from(export);
+    validate_pending_export_path(&export)?;
+    Ok(PendingQmdTarget::Export(export))
+}
+
+fn validate_pending_export_path(export: &Path) -> Result<()> {
+    let name = export
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("managed QMD pending export has no UTF-8 file name")?;
+    if !export.is_absolute() || !name.starts_with("cursor-") || !name.ends_with(".md") {
         anyhow::bail!(
-            "managed QMD pending marker has extra data: {}",
-            path.display()
+            "managed QMD pending export path is unsafe: {}",
+            export.display()
         );
     }
-    Ok(true)
+    Ok(())
 }
 
 fn qmd_refresh_state_dir(paths: &AgentPaths) -> PathBuf {
@@ -1604,6 +2317,37 @@ mod tests {
             CURSOR_HISTORY_HOOK_TIMEOUT_SECONDS
         );
         assert_eq!(value["hooks"]["stop"][2]["failClosed"], false);
+    }
+
+    #[test]
+    fn cursor_hook_edit_retries_and_preserves_a_concurrent_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        fs::create_dir_all(&paths.cursor_home).unwrap();
+        let hooks_path = paths.cursor_home.join("hooks.json");
+        fs::write(&hooks_path, r#"{"version":1,"hooks":{"stop":[]}}"#).unwrap();
+        let backup_root = temp.path().join("backups");
+        let mut render_count = 0;
+
+        let (changed, backup) = apply_cursor_hook_edit(&paths, &hooks_path, &backup_root, || {
+            render_count += 1;
+            if render_count == 1 {
+                fs::write(
+                    &hooks_path,
+                    r#"{"version":1,"hooks":{"stop":[{"command":"concurrent"}]}}"#,
+                )
+                .unwrap();
+            }
+            render_cursor_hooks(&hooks_path, TEST_MANAGED_COMMAND)
+        })
+        .unwrap();
+
+        assert!(changed);
+        assert!(backup.is_some());
+        assert_eq!(render_count, 2);
+        let value: Value = serde_json::from_slice(&fs::read(&hooks_path).unwrap()).unwrap();
+        assert_eq!(value["hooks"]["stop"][0]["command"], "concurrent");
+        assert_eq!(value["hooks"]["stop"][1]["command"], TEST_MANAGED_COMMAND);
     }
 
     #[test]
@@ -1744,7 +2488,7 @@ mod tests {
         let checked = sweep_cursor_history(&paths, true).unwrap();
 
         assert_eq!(checked, 2);
-        let sessions = temp.path().join("Documents/Obsidian/sessions");
+        let sessions = default_cursor_history_output_dir(&paths);
         assert!(sessions.join("cursor-chat.md").exists());
         assert!(sessions.join("cursor-chat-subagent-worker.md").exists());
         let main_export = fs::read_to_string(sessions.join("cursor-chat.md")).unwrap();
@@ -1753,9 +2497,113 @@ mod tests {
         assert_eq!(qmd_pending_exports(&paths).unwrap(), 2);
     }
 
+    #[test]
+    fn cursor_history_sweep_skips_only_unreadable_transcripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let valid = write_test_transcript(&paths);
+        let unreadable = paths
+            .cursor_home
+            .join("projects/example/agent-transcripts/new-format/new-format.jsonl");
+        fs::create_dir_all(unreadable.parent().unwrap()).unwrap();
+        fs::write(&unreadable, "{\"version\":999,\"newCursorSchema\":true}\n").unwrap();
+
+        let report = sweep_cursor_history_report_to(
+            &paths,
+            &default_cursor_history_output_dir(&paths),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.exported, 1);
+        assert_eq!(report.unreadable, vec![unreadable.clone()]);
+        assert!(default_cursor_history_output_dir(&paths)
+            .join("cursor-session.md")
+            .exists());
+        assert_eq!(cursor_history_unreadable_count(&paths).unwrap(), 1);
+        assert_eq!(
+            cursor_history_coverage(&paths).unwrap().unreadable,
+            vec![unreadable.canonicalize().unwrap()]
+        );
+        assert!(valid.exists());
+    }
+
+    #[test]
+    fn hook_export_skips_a_busy_lock_and_sweep_recovers_the_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let transcript = write_test_transcript(&paths);
+        let output_dir = temp.path().join("sessions");
+        let export_lock = acquire_cursor_history_export_lock(&paths).unwrap();
+
+        let started = std::time::Instant::now();
+        let skipped = export_cursor_history_with_lock_mode(
+            &paths,
+            &test_hook(&transcript),
+            Some(output_dir.clone()),
+            false,
+            CursorHistoryLockMode::SkipIfBusy,
+        )
+        .unwrap();
+
+        assert_eq!(skipped, None);
+        assert!(started.elapsed() < QMD_REFRESH_LOCK_WAIT);
+        assert!(!output_dir.join("cursor-session.md").exists());
+        drop(export_lock);
+
+        assert_eq!(
+            sweep_cursor_history_to(&paths, &output_dir, false).unwrap(),
+            1
+        );
+        assert!(output_dir.join("cursor-session.md").exists());
+    }
+
+    #[test]
+    fn manual_export_keeps_waiting_for_a_busy_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let transcript = write_test_transcript(&paths);
+        let export_lock = acquire_cursor_history_export_lock(&paths).unwrap();
+        let export_paths = paths.clone();
+        let export = std::thread::spawn(move || {
+            export_cursor_history_with_lock_mode(
+                &export_paths,
+                &test_hook(&transcript),
+                None,
+                false,
+                CursorHistoryLockMode::Wait,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!export.is_finished());
+        drop(export_lock);
+
+        assert!(export.join().unwrap().unwrap().is_some());
+    }
+
+    #[test]
+    fn hook_without_a_transcript_does_not_create_lock_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+
+        assert_eq!(
+            export_cursor_history_with_lock_mode(
+                &paths,
+                &json!({}),
+                None,
+                false,
+                CursorHistoryLockMode::SkipIfBusy,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(!qmd_refresh_state_dir(&paths).exists());
+    }
+
     #[cfg(unix)]
     #[test]
-    fn cursor_history_refreshes_qmd_for_each_completed_chat() {
+    fn unchanged_cursor_history_does_not_refresh_qmd_again() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AgentPaths::for_test(temp.path());
         let transcript = write_test_transcript(&paths);
@@ -1767,10 +2615,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&log).unwrap(), "update\nembed\n");
 
         export_cursor_history(&paths, &hook, None, true).unwrap();
-        assert_eq!(
-            fs::read_to_string(&log).unwrap(),
-            "update\nembed\nupdate\nembed\n"
-        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), "update\nembed\n");
     }
 
     #[cfg(unix)]
@@ -1889,9 +2734,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = AgentPaths::for_test(temp.path());
         let transcript = write_test_transcript(&paths);
-        let output = paths
-            .home
-            .join("Documents/Obsidian/sessions/cursor-session.md");
+        let output = default_cursor_history_output_dir(&paths).join("cursor-session.md");
         fs::create_dir_all(output.parent().unwrap()).unwrap();
         fs::write(&output, "personal note\n").unwrap();
 
@@ -1915,9 +2758,8 @@ mod tests {
         let error = export_cursor_history(&paths, &hook, None, false).unwrap_err();
 
         assert!(error.to_string().contains("does not match transcript id"));
-        assert!(!paths
-            .home
-            .join("Documents/Obsidian/sessions/cursor-another-chat.md")
+        assert!(!default_cursor_history_output_dir(&paths)
+            .join("cursor-another-chat.md")
             .exists());
     }
 
@@ -1928,6 +2770,27 @@ mod tests {
         }
         for pattern in ["codex-*.md", "notes/*.md", "cursor-?.md"] {
             assert!(!qmd_pattern_covers_cursor_exports(pattern), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn glob_matcher_preserves_single_and_double_star_semantics() {
+        for (pattern, candidate) in [
+            ("*.md", "cursor-chat.md"),
+            ("cursor-?.md", "cursor-a.md"),
+            ("**/cursor-*.md", "cursor-chat.md"),
+            ("**/cursor-*.md", "nested/deep/cursor-chat.md"),
+            ("notes/**/cursor-*.md", "notes/cursor-chat.md"),
+            ("notes/**/cursor-*.md", "notes/year/month/cursor-chat.md"),
+        ] {
+            assert!(glob_matches(pattern.as_bytes(), candidate.as_bytes()));
+        }
+        for (pattern, candidate) in [
+            ("*.md", "nested/cursor-chat.md"),
+            ("cursor-?.md", "cursor-chat.md"),
+            ("notes/**/cursor-*.md", "other/cursor-chat.md"),
+        ] {
+            assert!(!glob_matches(pattern.as_bytes(), candidate.as_bytes()));
         }
     }
 
@@ -1954,11 +2817,11 @@ mod tests {
         let paths = AgentPaths::for_test(temp.path());
         let log = temp.path().join("qmd.log");
 
-        install_test_qmd_with_config(&paths, &log, None, "codex-*.md", "yes (default)", true);
+        install_test_qmd_with_config(&paths, &log, None, "codex-*.md", "yes (default)", true, 0);
         let error = qmd_health(&paths).unwrap_err();
         assert!(error.to_string().contains("does not cover cursor-*.md"));
 
-        install_test_qmd_with_config(&paths, &log, None, "**/*.md", "no", true);
+        install_test_qmd_with_config(&paths, &log, None, "**/*.md", "no", true, 0);
         let error = qmd_health(&paths).unwrap_err();
         assert!(error.to_string().contains("excluded from global search"));
 
@@ -1967,6 +2830,88 @@ mod tests {
         assert!(health.sessions_included);
         assert_eq!(health.sessions_pattern, "**/*.md");
         assert_eq!(health.pending_embeddings, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qmd_exact_lookups_use_bounded_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let output_dir = default_cursor_history_output_dir(&paths);
+        fs::create_dir_all(&output_dir).unwrap();
+        let exports = (0..130)
+            .map(|index| {
+                let export = output_dir.join(format!("cursor-batch-{index:03}.md"));
+                fs::write(&export, format!("chat {index}\n")).unwrap();
+                export
+            })
+            .collect::<Vec<_>>();
+        let log = temp.path().join("qmd.log");
+        install_test_qmd(&paths, &log, None);
+
+        assert!(qmd_missing_exports(&paths, &exports).unwrap().is_empty());
+
+        let commands = qmd_test_commands(&log);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.split_once('\t').unwrap().0)
+                .collect::<Vec<_>>(),
+            vec!["multi-get", "multi-get", "multi-get"]
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| {
+                    command
+                        .split_once('\t')
+                        .unwrap()
+                        .1
+                        .trim_end_matches(',')
+                        .split(',')
+                        .count()
+                })
+                .collect::<Vec<_>>(),
+            vec![64, 64, 2]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_refresh_verifies_only_pending_exports() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let output_dir = default_cursor_history_output_dir(&paths);
+        fs::create_dir_all(&output_dir).unwrap();
+        for index in 0..100 {
+            fs::write(
+                output_dir.join(format!("cursor-existing-{index:03}.md")),
+                format!("existing chat {index}\n"),
+            )
+            .unwrap();
+        }
+        let pending = output_dir.join("cursor-pending.md");
+        fs::write(&pending, "pending chat\n").unwrap();
+        write_qmd_pending_marker(&paths, &pending).unwrap();
+        let log = temp.path().join("qmd.log");
+        install_test_qmd(&paths, &log, None);
+
+        assert!(refresh_pending_qmd_index_for_output(&paths, &output_dir, true).unwrap());
+
+        let commands = qmd_test_commands(&log);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.split_once('\t').unwrap().0)
+                .collect::<Vec<_>>(),
+            vec!["update", "embed", "collection", "status", "multi-get"]
+        );
+        let exact_paths = commands.last().unwrap().split_once('\t').unwrap().1;
+        assert_eq!(
+            exact_paths,
+            format!("qmd://{QMD_CURSOR_COLLECTION}/cursor-pending.md,")
+        );
+        assert_eq!(qmd_pending_exports(&paths).unwrap(), 0);
     }
 
     #[cfg(unix)]
@@ -1993,17 +2938,21 @@ mod tests {
     fn qmd_pending_cleanup_preserves_new_and_unrelated_files() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AgentPaths::for_test(temp.path());
+        let output_dir = default_cursor_history_output_dir(&paths);
+        fs::create_dir_all(&output_dir).unwrap();
+        let export = output_dir.join("cursor-same-chat.md");
+        fs::write(&export, "test\n").unwrap();
         let pending = qmd_pending_dir(&paths);
         fs::create_dir_all(&pending).unwrap();
         let unrelated = pending.join("personal-note.txt");
         fs::write(&unrelated, "keep me\n").unwrap();
-        write_qmd_pending_marker(&paths, "same-chat").unwrap();
-        let refresh_started = SystemTime::now();
+        write_qmd_pending_marker(&paths, &export).unwrap();
+        let work = pending_qmd_work(&paths, &output_dir).unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        write_qmd_pending_marker(&paths, "same-chat").unwrap();
+        write_qmd_pending_marker(&paths, &export).unwrap();
 
-        assert_eq!(qmd_pending_exports(&paths).unwrap(), 2);
-        clear_qmd_pending_markers(&paths, refresh_started).unwrap();
+        assert_eq!(qmd_pending_exports(&paths).unwrap(), 1);
+        clear_qmd_pending_markers(&work.markers).unwrap();
 
         assert_eq!(qmd_pending_exports(&paths).unwrap(), 1);
         assert_eq!(fs::read_to_string(unrelated).unwrap(), "keep me\n");
@@ -2023,7 +2972,8 @@ mod tests {
         fs::create_dir_all(qmd_refresh_state_dir(&paths)).unwrap();
         symlink(&victim, qmd_pending_dir(&paths)).unwrap();
 
-        let error = clear_qmd_pending_markers(&paths, SystemTime::now()).unwrap_err();
+        let error =
+            pending_qmd_work(&paths, &default_cursor_history_output_dir(&paths)).unwrap_err();
 
         assert!(error.to_string().contains("symlinked QMD pending"));
         assert_eq!(fs::read_to_string(unrelated).unwrap(), "keep me\n");
@@ -2037,8 +2987,10 @@ mod tests {
         let transcript = write_test_transcript(&paths);
         let log = temp.path().join("qmd.log");
         install_test_qmd(&paths, &log, None);
-        export_cursor_history(&paths, &test_hook(&transcript), None, false).unwrap();
-        write_qmd_pending_marker(&paths, "session").unwrap();
+        let export = export_cursor_history(&paths, &test_hook(&transcript), None, false)
+            .unwrap()
+            .unwrap();
+        write_qmd_pending_marker(&paths, &export).unwrap();
         let refresh_lock = acquire_qmd_refresh_lock(&paths).unwrap().unwrap();
         let refresh_paths = paths.clone();
 
@@ -2055,14 +3007,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn refresh_ignores_unrelated_global_pending_embeddings() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        let transcript = write_test_transcript(&paths);
+        let log = temp.path().join("qmd.log");
+        install_test_qmd_with_config(&paths, &log, None, "**/*.md", "yes (default)", true, 7);
+        let export = export_cursor_history(&paths, &test_hook(&transcript), None, false)
+            .unwrap()
+            .unwrap();
+        write_qmd_pending_marker(&paths, &export).unwrap();
+
+        assert!(refresh_qmd_index(&paths, true).unwrap());
+        assert_eq!(qmd_pending_exports(&paths).unwrap(), 0);
+        assert!(qmd_refresh_last_success(&paths).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn refresh_keeps_marker_when_export_is_not_retrievable() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AgentPaths::for_test(temp.path());
         let transcript = write_test_transcript(&paths);
         let log = temp.path().join("qmd.log");
-        install_test_qmd_with_config(&paths, &log, None, "**/*.md", "yes (default)", false);
-        export_cursor_history(&paths, &test_hook(&transcript), None, false).unwrap();
-        write_qmd_pending_marker(&paths, "session").unwrap();
+        install_test_qmd_with_config(&paths, &log, None, "**/*.md", "yes (default)", false, 0);
+        let export = export_cursor_history(&paths, &test_hook(&transcript), None, false)
+            .unwrap()
+            .unwrap();
+        write_qmd_pending_marker(&paths, &export).unwrap();
 
         let error = refresh_qmd_index(&paths, true).unwrap_err();
 
@@ -2127,6 +3099,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn hard_expired_lock_is_removed_even_when_its_pid_is_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("refresh.lock");
+        fs::write(&path, format!("{}:0\n", std::process::id())).unwrap();
+
+        let snapshot = read_lock_snapshot(&path).unwrap().unwrap();
+        assert!(lock_owner_is_active(&snapshot.token));
+        assert!(remove_stale_lock_if_unchanged(&path).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dangling_history_lock_symlinks_are_refused() {
         use std::os::unix::fs::symlink;
 
@@ -2177,7 +3162,7 @@ mod tests {
 
     #[cfg(unix)]
     fn install_test_qmd(paths: &AgentPaths, log: &Path, fail_on: Option<&str>) {
-        install_test_qmd_with_config(paths, log, fail_on, "**/*.md", "yes (default)", true);
+        install_test_qmd_with_config(paths, log, fail_on, "**/*.md", "yes (default)", true, 0);
     }
 
     #[cfg(unix)]
@@ -2188,12 +3173,14 @@ mod tests {
         pattern: &str,
         include: &str,
         retrieve_exports: bool,
+        pending_embeddings: usize,
     ) {
         use std::os::unix::fs::PermissionsExt;
 
         let qmd = paths.home.join(".local/bin/qmd");
-        let sessions = paths.home.join("Documents/Obsidian/sessions");
+        let sessions = default_cursor_history_output_dir(paths);
         let export_lock = qmd_refresh_state_dir(paths).join("cursor-history-export.lock");
+        let command_log = log.with_extension("commands.log");
         fs::create_dir_all(qmd.parent().unwrap()).unwrap();
         let failure = fail_on
             .map(|subcommand| format!("[ \"$1\" = \"{subcommand}\" ] && exit 9\n"))
@@ -2201,15 +3188,28 @@ mod tests {
         let multi_get_result = if retrieve_exports {
             format!(
                 concat!(
-                    "name=${{2##*/}}\n",
-                    "name=${{name%,}}\n",
-                    "target={}/\"$name\"\n",
-                    "[ -f \"$target\" ] || {{ printf '[]\\n'; exit 0; }}\n",
-                    "printf '[{{\"file\":\"qmd://sessions/%s\",\"title\":\"test\",\"body\":\"' \"$name\"\n",
-                    "sed -e 's/\\\\/\\\\\\\\/g' -e 's/\"/\\\\\"/g' -e 's/$/\\\\n/' \"$target\" | tr -d '\\n'\n",
-                    "printf '\"}}]\\n'\n"
+                    "paths=${{2%,}}\n",
+                    "old_ifs=$IFS\n",
+                    "IFS=,\n",
+                    "set -f\n",
+                    "set -- $paths\n",
+                    "set +f\n",
+                    "IFS=$old_ifs\n",
+                    "printf '['\n",
+                    "separator=''\n",
+                    "for virtual in \"$@\"; do\n",
+                    "  name=${{virtual##*/}}\n",
+                    "  target={}/\"$name\"\n",
+                    "  [ -f \"$target\" ] || continue\n",
+                    "  printf '%s{{\"file\":\"qmd://{}/%s\",\"title\":\"test\",\"body\":\"' \"$separator\" \"$name\"\n",
+                    "  sed -e 's/\\\\/\\\\\\\\/g' -e 's/\"/\\\\\"/g' -e 's/$/\\\\n/' \"$target\" | tr -d '\\n'\n",
+                    "  printf '\"}}'\n",
+                    "  separator=','\n",
+                    "done\n",
+                    "printf ']\\n'\n"
                 ),
-                shell_quote(&sessions.to_string_lossy())
+                shell_quote(&sessions.to_string_lossy()),
+                QMD_CURSOR_COLLECTION
             )
         } else {
             "printf '[]\\n'\n".to_string()
@@ -2219,6 +3219,7 @@ mod tests {
             format!(
                 concat!(
                     "#!/bin/sh\n",
+                    "printf '%s\\t%s\\n' \"$1\" \"$2\" >> {}\n",
                     "case \"$1\" in\n",
                     "update|embed)\n",
                     "  printf '%s\\n' \"$1\" >> {}\n",
@@ -2231,7 +3232,7 @@ mod tests {
                     "  exit 0\n",
                     "  ;;\n",
                     "status)\n",
-                    "  printf '%s\\n' '  Pending:  0 need embedding'\n",
+                    "  printf '%s\\n' '  Pending:  {} need embedding'\n",
                     "  exit 0\n",
                     "  ;;\n",
                     "multi-get)\n",
@@ -2240,16 +3241,27 @@ mod tests {
                     "*) exit 9 ;;\n",
                     "esac\n"
                 ),
+                shell_quote(&command_log.to_string_lossy()),
                 shell_quote(&log.to_string_lossy()),
                 shell_quote(&export_lock.to_string_lossy()),
                 sessions.display(),
                 pattern,
                 include,
+                pending_embeddings,
                 failure = failure,
                 multi_get_result = multi_get_result,
             ),
         )
         .unwrap();
         fs::set_permissions(&qmd, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn qmd_test_commands(log: &Path) -> Vec<String> {
+        fs::read_to_string(log.with_extension("commands.log"))
+            .unwrap()
+            .lines()
+            .map(ToString::to_string)
+            .collect()
     }
 }
