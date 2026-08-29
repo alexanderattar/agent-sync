@@ -1712,7 +1712,8 @@ fn lock_token_owner_is_active(token: &str) -> bool {
     let Some(pid) = token
         .split(':')
         .next()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .and_then(|raw| raw.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
     else {
         return false;
     };
@@ -1817,11 +1818,9 @@ mod tests {
         let state = state_dir(&paths);
         ensure_dir(&state).unwrap();
         let path = state.join("sync.lock");
-        fs::write(
-            &path,
-            format!("{}:{}\n", u32::MAX, Utc::now().timestamp_millis()),
-        )
-        .unwrap();
+        let dead_token = format!("{}:{}", u32::MAX, Utc::now().timestamp_millis());
+        assert!(!lock_token_owner_is_active(&dead_token));
+        fs::write(&path, format!("{dead_token}\n")).unwrap();
 
         let lock = SyncLock::acquire(&paths).unwrap();
 

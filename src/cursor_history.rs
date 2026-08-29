@@ -1974,7 +1974,8 @@ fn lock_owner_is_active(token: &str) -> bool {
     let Some(pid) = token
         .split(':')
         .next()
-        .and_then(|value| value.trim().parse::<u32>().ok())
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
     else {
         return false;
     };
