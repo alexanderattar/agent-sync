@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum AgentKind {
     Codex,
     Claude,
+    Cursor,
 }
 
 impl Display for AgentKind {
@@ -19,6 +20,7 @@ impl Display for AgentKind {
         match self {
             AgentKind::Codex => f.write_str("codex"),
             AgentKind::Claude => f.write_str("claude"),
+            AgentKind::Cursor => f.write_str("cursor"),
         }
     }
 }
@@ -29,6 +31,8 @@ pub struct AgentPaths {
     pub codex_home: PathBuf,
     pub claude_home: PathBuf,
     pub claude_config: PathBuf,
+    pub cursor_home: PathBuf,
+    pub cursor_config: PathBuf,
     pub agents_home: PathBuf,
 }
 
@@ -38,6 +42,8 @@ impl AgentPaths {
         codex_home: Option<PathBuf>,
         claude_home: Option<PathBuf>,
         claude_config: Option<PathBuf>,
+        cursor_home: Option<PathBuf>,
+        cursor_config: Option<PathBuf>,
         agents_home: Option<PathBuf>,
     ) -> Result<Self> {
         let home = home.map_or_else(home_dir, Ok)?;
@@ -45,6 +51,8 @@ impl AgentPaths {
         let claude_home = claude_home.unwrap_or_else(|| home.join(".claude"));
         let claude_config =
             claude_config.unwrap_or_else(|| default_claude_config(&home, &claude_home));
+        let cursor_home = cursor_home.unwrap_or_else(|| home.join(".cursor"));
+        let cursor_config = cursor_config.unwrap_or_else(|| cursor_home.join("mcp.json"));
         let agents_home = agents_home.unwrap_or_else(|| home.join(".agents"));
 
         Ok(Self {
@@ -52,6 +60,8 @@ impl AgentPaths {
             codex_home,
             claude_home,
             claude_config,
+            cursor_home,
+            cursor_config,
             agents_home,
         })
     }
@@ -62,15 +72,17 @@ impl AgentPaths {
             codex_home: root.join(".codex"),
             claude_home: root.join(".claude"),
             claude_config: root.join(".claude.json"),
+            cursor_home: root.join(".cursor"),
+            cursor_config: root.join(".cursor/mcp.json"),
             agents_home: root.join(".agents"),
         }
     }
 }
 
 fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set; pass explicit --codex-home and --claude-home paths")
+    env::var_os("HOME").map(PathBuf::from).context(
+        "HOME is not set; pass explicit --codex-home, --claude-home, and --cursor-home paths",
+    )
 }
 
 fn default_claude_config(home: &Path, claude_home: &Path) -> PathBuf {

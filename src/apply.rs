@@ -1,25 +1,36 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     adapters::{AgentKind, AgentPaths},
     fsx::{
-        ensure_dir, path_content_equal, read_to_string_if_exists, replace_dir_with_backup,
-        replace_file_with_backup,
+        ensure_dir, hash_bytes, hash_path, path_content_equal, read_to_string_if_exists,
+        remove_target_if_unchanged, replace_dir_with_backup_if_unchanged,
+        replace_file_with_backup_if_unchanged, restore_backup_atomically_if_unchanged,
     },
     manifest::{Manifest, Resource, ResourceKind},
-    mcp::{load_pack_mcp, write_claude_mcp, write_codex_mcp, McpServer},
+    mcp::{
+        cursor_mcp_server, cursor_mcp_value, discover_cursor_project_mcp_names,
+        ensure_cursor_mcp_write_safe, load_pack_mcp, read_cursor_mcp_snapshot,
+        render_cursor_mcp_additive_with_updates, write_claude_mcp, write_codex_mcp, McpServer,
+    },
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+const CURSOR_MCP_STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyOptions {
     pub dry_run: bool,
+    pub backup_root: Option<PathBuf>,
+    pub allow_updates: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -36,6 +47,7 @@ pub struct Change {
 pub enum ChangeAction {
     Add,
     Update,
+    ManagedUpdate,
     Unchanged,
     Skip,
 }
@@ -45,6 +57,33 @@ pub struct ApplyReport {
     pub dry_run: bool,
     pub changes: Vec<Change>,
     pub backup_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct AppliedWrite {
+    destination: PathBuf,
+    backup: Option<PathBuf>,
+    installed_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CursorMcpOwnershipState {
+    schema_version: u32,
+    destination: PathBuf,
+    servers: BTreeMap<String, String>,
+}
+
+struct CursorMcpStateSnapshot {
+    path: PathBuf,
+    raw: Option<Vec<u8>>,
+    state: CursorMcpOwnershipState,
+}
+
+#[derive(Default)]
+struct McpApplyResult {
+    config_write: Option<AppliedWrite>,
+    state_write: Option<AppliedWrite>,
 }
 
 impl ApplyReport {
@@ -97,9 +136,9 @@ pub fn diff_pack(paths: &AgentPaths, pack: &Path, targets: &[AgentKind]) -> Resu
                 continue;
             };
             let action = match resource.kind {
-                ResourceKind::Mcp => mcp_change_action(paths, &mcp, *target)?,
+                ResourceKind::Mcp => mcp_change_action(paths, &mcp, &resource.name, *target)?,
                 ResourceKind::Rule => rule_change_action(pack, resource, *target, &destination)?,
-                _ => file_change_action(pack, resource, &destination)?,
+                _ => file_change_action(pack, resource, *target, &destination)?,
             };
             changes.push(Change {
                 action,
@@ -110,7 +149,7 @@ pub fn diff_pack(paths: &AgentPaths, pack: &Path, targets: &[AgentKind]) -> Resu
             });
         }
     }
-    dedupe_mcp_changes(changes)
+    Ok(changes)
 }
 
 pub fn apply_pack(
@@ -128,67 +167,240 @@ pub fn apply_pack(
         });
     }
 
-    let backup_root = paths
-        .home
-        .join(".agent-sync")
-        .join("backups")
-        .join(Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
+    if !changes.iter().any(|change| {
+        matches!(
+            change.action,
+            ChangeAction::Add | ChangeAction::Update | ChangeAction::ManagedUpdate
+        )
+    }) {
+        return Ok(ApplyReport {
+            dry_run: false,
+            changes,
+            backup_root: None,
+        });
+    }
+
+    let backup_root = options.backup_root.unwrap_or_else(|| {
+        paths
+            .home
+            .join(".agent-sync")
+            .join("backups")
+            .join(Utc::now().format("%Y%m%dT%H%M%S%.9fZ").to_string())
+    });
     ensure_dir(&backup_root)?;
 
     let manifest = Manifest::load(pack)?;
     let mcp = load_pack_mcp(pack)?;
     let mut applied_mcp_targets = BTreeSet::new();
-    for resource in &manifest.resources {
-        for target in targets {
-            if !resource.targets.contains(target) {
-                continue;
-            }
-            match resource.kind {
-                ResourceKind::Skill
-                | ResourceKind::MemoryReference
-                | ResourceKind::AutomationTemplate => {
+    let mut applied_writes = Vec::new();
+    let apply_result = (|| -> Result<()> {
+        for resource in &manifest.resources {
+            for target in targets {
+                if !resource.targets.contains(target) {
+                    continue;
+                }
+                let action = if resource.kind != ResourceKind::Mcp {
                     let Some(destination) = destination_for(paths, resource, *target) else {
                         continue;
                     };
-                    let source = pack.join(&resource.pack_path);
-                    if path_content_equal(&source, &destination)? {
-                        continue;
-                    }
-                    let root = agent_root(paths, *target);
-                    let backup =
-                        replace_dir_with_backup(&backup_root, root, &source, &destination)?;
-                    update_backup(&mut changes, *target, resource, backup);
-                }
-                ResourceKind::Rule => {
-                    let Some(destination) = destination_for(paths, resource, *target) else {
-                        continue;
+                    let action = match resource.kind {
+                        ResourceKind::Rule => {
+                            rule_change_action(pack, resource, *target, &destination)?
+                        }
+                        ResourceKind::Skill
+                        | ResourceKind::MemoryReference
+                        | ResourceKind::AutomationTemplate => {
+                            file_change_action(pack, resource, *target, &destination)?
+                        }
+                        ResourceKind::Mcp => unreachable!(),
                     };
-                    let content = rendered_rule(pack, resource, *target)?;
-                    if read_to_string_if_exists(&destination)?.as_deref() == Some(content.as_str())
-                    {
-                        continue;
-                    }
-                    let root = agent_root(paths, *target);
-                    let backup = replace_file_with_backup(
-                        &backup_root,
-                        root,
-                        &destination,
-                        content.as_bytes(),
-                    )?;
-                    update_backup(&mut changes, *target, resource, backup);
+                    update_action_and_destination(
+                        &mut changes,
+                        *target,
+                        resource,
+                        action,
+                        destination,
+                    );
+                    Some(action)
+                } else {
+                    planned_action(&changes, *target, resource)
+                };
+                if action == Some(ChangeAction::Update) && !options.allow_updates {
+                    bail!(
+                        "apply is blocked because {} {} became an update and target replacements are disabled",
+                        target,
+                        resource_label(resource)
+                    );
                 }
-                ResourceKind::Mcp => {
-                    if !applied_mcp_targets.insert(*target) {
-                        continue;
+                if matches!(action, Some(ChangeAction::Skip | ChangeAction::Unchanged)) {
+                    continue;
+                }
+                match resource.kind {
+                    ResourceKind::Skill
+                    | ResourceKind::MemoryReference
+                    | ResourceKind::AutomationTemplate => {
+                        let Some(destination) = destination_for(paths, resource, *target) else {
+                            continue;
+                        };
+                        let source = pack.join(&resource.pack_path);
+                        if path_content_equal(&source, &destination)? {
+                            continue;
+                        }
+                        let installed_sha256 = hash_path(&source)?;
+                        let latest_action =
+                            file_change_action(pack, resource, *target, &destination)?;
+                        update_action_and_destination(
+                            &mut changes,
+                            *target,
+                            resource,
+                            latest_action,
+                            destination.clone(),
+                        );
+                        if latest_action == ChangeAction::Update && !options.allow_updates {
+                            bail!(
+                                "apply is blocked because {} {} became an update and target replacements are disabled",
+                                target,
+                                resource_label(resource)
+                            );
+                        }
+                        if matches!(latest_action, ChangeAction::Skip | ChangeAction::Unchanged) {
+                            continue;
+                        }
+                        let expected_sha256 = match latest_action {
+                            ChangeAction::Add => None,
+                            ChangeAction::Update | ChangeAction::ManagedUpdate => {
+                                Some(hash_path(&destination)?)
+                            }
+                            ChangeAction::Skip | ChangeAction::Unchanged => unreachable!(),
+                        };
+                        let root = agent_root(paths, *target);
+                        let backup = replace_dir_with_backup_if_unchanged(
+                            &backup_root,
+                            root,
+                            &source,
+                            &destination,
+                            expected_sha256.as_deref(),
+                        )?;
+                        applied_writes.push(AppliedWrite {
+                            destination: destination.clone(),
+                            backup: backup.clone(),
+                            installed_sha256: Some(installed_sha256),
+                        });
+                        update_backup(&mut changes, *target, resource, backup);
                     }
-                    if !mcp_needs_apply(&changes, *target) {
-                        continue;
+                    ResourceKind::Rule => {
+                        let Some(destination) = destination_for(paths, resource, *target) else {
+                            continue;
+                        };
+                        let content = rendered_rule(pack, resource, *target)?;
+                        if read_to_string_if_exists(&destination)?.as_deref()
+                            == Some(content.as_str())
+                        {
+                            continue;
+                        }
+                        let installed_sha256 = hash_bytes(content.as_bytes());
+                        let latest_action =
+                            rule_change_action(pack, resource, *target, &destination)?;
+                        update_action_and_destination(
+                            &mut changes,
+                            *target,
+                            resource,
+                            latest_action,
+                            destination.clone(),
+                        );
+                        if latest_action == ChangeAction::Update && !options.allow_updates {
+                            bail!(
+                                "apply is blocked because {} {} became an update and target replacements are disabled",
+                                target,
+                                resource_label(resource)
+                            );
+                        }
+                        if matches!(latest_action, ChangeAction::Skip | ChangeAction::Unchanged) {
+                            continue;
+                        }
+                        let expected = match latest_action {
+                            ChangeAction::Add => None,
+                            ChangeAction::Update | ChangeAction::ManagedUpdate => {
+                                read_bytes_if_exists(&destination)?
+                            }
+                            ChangeAction::Skip | ChangeAction::Unchanged => unreachable!(),
+                        };
+                        let root = agent_root(paths, *target);
+                        let backup = replace_file_with_backup_if_unchanged(
+                            &backup_root,
+                            root,
+                            &destination,
+                            expected.as_deref(),
+                            content.as_bytes(),
+                        )?;
+                        applied_writes.push(AppliedWrite {
+                            destination: destination.clone(),
+                            backup: backup.clone(),
+                            installed_sha256: Some(installed_sha256),
+                        });
+                        update_backup(&mut changes, *target, resource, backup);
                     }
-                    let backup = apply_mcp(paths, &backup_root, &mcp, *target)?;
-                    update_mcp_backup(&mut changes, *target, backup);
+                    ResourceKind::Mcp => {
+                        if applied_mcp_targets.contains(target) {
+                            continue;
+                        }
+                        refresh_mcp_actions(paths, &manifest, &mcp, *target, &mut changes)?;
+                        if !options.allow_updates
+                            && changes.iter().any(|change| {
+                                change.target == *target
+                                    && change.resource.starts_with("Mcp:")
+                                    && change.action == ChangeAction::Update
+                            })
+                        {
+                            bail!(
+                                "apply is blocked because a {} MCP server became an update and target replacements are disabled",
+                                target
+                            );
+                        }
+                        applied_mcp_targets.insert(*target);
+                        if !mcp_needs_apply(&changes, *target) {
+                            continue;
+                        }
+                        let result = apply_mcp(paths, &backup_root, &mcp, *target, &changes)?;
+                        let backup = result
+                            .config_write
+                            .as_ref()
+                            .and_then(|write| write.backup.clone());
+                        if let Some(write) = result.config_write {
+                            applied_writes.push(write);
+                        }
+                        if let Some(write) = result.state_write {
+                            applied_writes.push(write);
+                        }
+                        update_mcp_backup(&mut changes, *target, backup);
+                    }
                 }
             }
         }
+        let verification = verify_pack(paths, pack, targets)?;
+        if !verification.ok {
+            bail!(
+                "post-apply verification failed: {}",
+                verification.errors.join("; ")
+            );
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = apply_result {
+        let rollback = rollback_applied_writes(&applied_writes);
+        return match rollback {
+            Ok(()) => Err(error).with_context(|| {
+                format!(
+                    "apply failed and all completed writes were rolled back; backups: {}",
+                    backup_root.display()
+                )
+            }),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "apply failed: {error:#}; rollback also failed: {rollback_error:#}; backups: {}",
+                backup_root.display()
+            )),
+        };
     }
 
     Ok(ApplyReport {
@@ -199,62 +411,32 @@ pub fn apply_pack(
 }
 
 pub fn verify_pack(paths: &AgentPaths, pack: &Path, targets: &[AgentKind]) -> Result<VerifyReport> {
-    let manifest = Manifest::load(pack)?;
-    let mcp = load_pack_mcp(pack)?;
+    let changes = diff_pack(paths, pack, targets)?;
     let mut checks = Vec::new();
     let mut errors = Vec::new();
 
-    for resource in &manifest.resources {
-        if resource.kind == ResourceKind::Mcp {
-            continue;
-        }
-        for target in targets {
-            if !resource.targets.contains(target) {
-                continue;
-            }
-            let Some(destination) = destination_for(paths, resource, *target) else {
-                continue;
-            };
-            if destination.exists() {
-                checks.push(format!(
-                    "{} {} installed at {}",
-                    target,
-                    resource_label(resource),
-                    destination.display()
-                ));
-            } else {
+    for change in changes {
+        match change.action {
+            ChangeAction::Unchanged => checks.push(format!(
+                "{} {} matches at {}",
+                change.target,
+                change.resource,
+                change.destination.display()
+            )),
+            ChangeAction::Skip => checks.push(format!(
+                "{} {} is target-owned and preserved at {}",
+                change.target,
+                change.resource,
+                change.destination.display()
+            )),
+            ChangeAction::Add | ChangeAction::Update | ChangeAction::ManagedUpdate => {
                 errors.push(format!(
-                    "{} {} missing at {}",
-                    target,
-                    resource_label(resource),
-                    destination.display()
-                ));
-            }
-        }
-    }
-
-    for target in targets {
-        match target {
-            AgentKind::Claude => {
-                let existing = crate::mcp::discover_claude_mcp(&paths.claude_config)?;
-                for name in mcp.keys() {
-                    if existing.contains_key(name) {
-                        checks.push(format!("claude mcp `{name}` configured"));
-                    } else {
-                        errors.push(format!("claude mcp `{name}` missing"));
-                    }
-                }
-            }
-            AgentKind::Codex => {
-                let existing =
-                    crate::mcp::discover_codex_mcp(&paths.codex_home.join("config.toml"))?;
-                for name in mcp.keys() {
-                    if existing.contains_key(name) {
-                        checks.push(format!("codex mcp `{name}` configured"));
-                    } else {
-                        errors.push(format!("codex mcp `{name}` missing"));
-                    }
-                }
+                    "{} {} still needs {:?} at {}",
+                    change.target,
+                    change.resource,
+                    change.action,
+                    change.destination.display()
+                ))
             }
         }
     }
@@ -291,6 +473,23 @@ fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -
         (ResourceKind::Skill, AgentKind::Claude) => {
             Some(paths.claude_home.join("skills").join(&resource.name))
         }
+        (ResourceKind::Skill, AgentKind::Cursor) => {
+            let cursor_owned = paths.cursor_home.join("skills").join(&resource.name);
+            if cursor_owned.exists() {
+                return Some(cursor_owned);
+            }
+            let shared = match resource.source_agent.as_str() {
+                "codex" => paths.codex_home.join("skills").join(&resource.name),
+                "claude" => paths.claude_home.join("skills").join(&resource.name),
+                "agents" => paths.agents_home.join("skills").join(&resource.name),
+                _ => cursor_owned.clone(),
+            };
+            if shared.exists() {
+                Some(shared)
+            } else {
+                Some(cursor_owned)
+            }
+        }
         (ResourceKind::Rule, AgentKind::Codex) if resource.name == "codex-agents" => {
             Some(paths.codex_home.join("AGENTS.md"))
         }
@@ -303,8 +502,15 @@ fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -
         (ResourceKind::Rule, AgentKind::Claude) if resource.name == "claude-user" => {
             Some(paths.claude_home.join("CLAUDE.md"))
         }
+        (ResourceKind::Rule, AgentKind::Cursor) if resource.name == "codex-agents" => Some(
+            paths
+                .cursor_home
+                .join("rules")
+                .join("imported-codex-agents.mdc"),
+        ),
         (ResourceKind::Mcp, AgentKind::Codex) => Some(paths.codex_home.join("config.toml")),
         (ResourceKind::Mcp, AgentKind::Claude) => Some(paths.claude_config.clone()),
+        (ResourceKind::Mcp, AgentKind::Cursor) => Some(paths.cursor_config.clone()),
         (ResourceKind::MemoryReference, AgentKind::Claude) => Some(
             paths
                 .claude_home
@@ -318,13 +524,23 @@ fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -
 fn file_change_action(
     pack: &Path,
     resource: &Resource,
+    target: AgentKind,
     destination: &Path,
 ) -> Result<ChangeAction> {
     let source = pack.join(&resource.pack_path);
-    if !destination.exists() {
+    let metadata = symlink_metadata_if_exists(destination)?;
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+        && target == AgentKind::Cursor
+    {
+        Ok(ChangeAction::Skip)
+    } else if metadata.is_none() {
         Ok(ChangeAction::Add)
     } else if path_content_equal(&source, destination)? {
         Ok(ChangeAction::Unchanged)
+    } else if target == AgentKind::Cursor {
+        Ok(ChangeAction::Skip)
     } else {
         Ok(ChangeAction::Update)
     }
@@ -337,46 +553,140 @@ fn rule_change_action(
     destination: &Path,
 ) -> Result<ChangeAction> {
     let content = rendered_rule(pack, resource, target)?;
-    if !destination.exists() {
+    let metadata = symlink_metadata_if_exists(destination)?;
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+        && target == AgentKind::Cursor
+    {
+        Ok(ChangeAction::Skip)
+    } else if metadata.is_none() {
         Ok(ChangeAction::Add)
     } else if read_to_string_if_exists(destination)?.as_deref() == Some(content.as_str()) {
         Ok(ChangeAction::Unchanged)
+    } else if target == AgentKind::Cursor {
+        let existing = read_to_string_if_exists(destination)?;
+        Ok(cursor_rule_replacement_action(
+            resource,
+            existing.as_deref(),
+        ))
     } else {
         Ok(ChangeAction::Update)
+    }
+}
+
+fn cursor_rule_replacement_action(resource: &Resource, existing: Option<&str>) -> ChangeAction {
+    if resource.name == "codex-agents"
+        && existing.is_some_and(|content| {
+            content == LEGACY_CURSOR_CODEX_RULE || managed_cursor_rule_is_unmodified(content)
+        })
+    {
+        ChangeAction::ManagedUpdate
+    } else {
+        ChangeAction::Skip
     }
 }
 
 fn mcp_change_action(
     paths: &AgentPaths,
     mcp: &BTreeMap<String, McpServer>,
+    name: &str,
     target: AgentKind,
 ) -> Result<ChangeAction> {
+    let Some(server) = mcp.get(name) else {
+        bail!("manifest MCP `{name}` is missing from mcp/servers.json");
+    };
     let existing = match target {
         AgentKind::Codex => crate::mcp::discover_codex_mcp(&paths.codex_home.join("config.toml"))?,
         AgentKind::Claude => crate::mcp::discover_claude_mcp(&paths.claude_config)?,
+        AgentKind::Cursor => {
+            let project_owned = discover_cursor_project_mcp_names(&paths.cursor_home)?;
+            if project_owned.contains(name) {
+                return Ok(ChangeAction::Skip);
+            }
+            let (_, configured) = read_cursor_mcp_snapshot(&paths.cursor_config)?;
+            if let Some(existing) = configured.get(name) {
+                if cursor_mcp_server(existing).as_ref() == Some(server) {
+                    return Ok(ChangeAction::Unchanged);
+                }
+                let state = load_cursor_mcp_state(paths)?;
+                let current_sha256 = cursor_mcp_value_sha256(existing)?;
+                return Ok(if state.state.servers.get(name) == Some(&current_sha256) {
+                    ChangeAction::ManagedUpdate
+                } else {
+                    ChangeAction::Skip
+                });
+            }
+            ensure_cursor_mcp_write_safe(&paths.cursor_config)?;
+            return Ok(ChangeAction::Add);
+        }
     };
-    let missing = mcp
-        .iter()
-        .any(|(name, server)| existing.get(name) != Some(server));
-    Ok(if missing && existing.is_empty() {
-        ChangeAction::Add
-    } else if missing {
-        ChangeAction::Update
-    } else {
-        ChangeAction::Unchanged
+    Ok(match existing.get(name) {
+        Some(existing) if existing == server => ChangeAction::Unchanged,
+        Some(_) => ChangeAction::Update,
+        None => ChangeAction::Add,
     })
 }
 
+fn symlink_metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+const CURSOR_CODEX_RULE_FRONTMATTER: &str =
+    "---\ndescription: Imported Codex agent guidance\nalwaysApply: true\n---\n";
+const CURSOR_CODEX_RULE_MARKER_PREFIX: &str =
+    "<!-- agent-sync-managed: cursor-codex-agents body-sha256=";
+const CURSOR_CODEX_RULE_MARKER_SUFFIX: &str = " -->";
+const LEGACY_CURSOR_CODEX_RULE: &str = "---\ndescription: Bridge to Codex global agent rules\nalwaysApply: true\n---\n# Codex Agent Rule Bridge\n\nBefore starting a task, read and follow `~/.codex/AGENTS.md` when it exists. Treat it as shared guidance. Direct user instructions and Cursor-specific settings and rules take precedence if they conflict with that file.\n\nWhen prior work may matter, search the QMD `sessions` collection. QMD history is searchable context, not a resumable Cursor chat.\n";
+
 fn rendered_rule(pack: &Path, resource: &Resource, target: AgentKind) -> Result<String> {
     let raw = std::fs::read_to_string(pack.join(&resource.pack_path))?;
-    if resource.name == "codex-agents" && target == AgentKind::Claude {
-        Ok(format!(
+    match (resource.name.as_str(), target) {
+        ("codex-agents", AgentKind::Claude) => Ok(format!(
             "# Imported Codex Agent Rules\n\nImported by `agent-sync` from pack resource `codex-agents`.\n\n{}",
             raw
-        ))
-    } else {
-        Ok(raw)
+        )),
+        ("codex-agents", AgentKind::Cursor) => Ok(render_cursor_codex_rule(&raw)),
+        _ => Ok(raw),
     }
+}
+
+fn render_cursor_codex_rule(raw: &str) -> String {
+    let body = format!(
+        "# Imported Codex Agent Rules\n\nImported by `agent-sync` from pack resource `codex-agents`. Cursor-specific settings and rules take precedence if they conflict.\n\n{raw}"
+    );
+    let body_sha256 = hash_bytes(body.as_bytes());
+    format!(
+        "{CURSOR_CODEX_RULE_FRONTMATTER}{CURSOR_CODEX_RULE_MARKER_PREFIX}{body_sha256}{CURSOR_CODEX_RULE_MARKER_SUFFIX}\n{body}"
+    )
+}
+
+fn managed_cursor_rule_is_unmodified(content: &str) -> bool {
+    let Some(marked_body) = content.strip_prefix(CURSOR_CODEX_RULE_FRONTMATTER) else {
+        return false;
+    };
+    let Some((marker, body)) = marked_body.split_once('\n') else {
+        return false;
+    };
+    let Some(expected_sha256) = cursor_rule_marker_hash(marker) else {
+        return false;
+    };
+    hash_bytes(body.as_bytes()) == expected_sha256
+}
+
+fn cursor_rule_marker_hash(marker: &str) -> Option<&str> {
+    let hash = marker
+        .strip_prefix(CURSOR_CODEX_RULE_MARKER_PREFIX)?
+        .strip_suffix(CURSOR_CODEX_RULE_MARKER_SUFFIX)?;
+    (hash.len() == 64
+        && hash
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, 'a'..='f')))
+    .then_some(hash)
 }
 
 fn apply_mcp(
@@ -384,17 +694,354 @@ fn apply_mcp(
     backup_root: &Path,
     mcp: &BTreeMap<String, McpServer>,
     target: AgentKind,
-) -> Result<Option<PathBuf>> {
+    changes: &[Change],
+) -> Result<McpApplyResult> {
     match target {
         AgentKind::Claude => {
+            let expected = read_bytes_if_exists(&paths.claude_config)?;
             let content = write_claude_mcp(&paths.claude_config, mcp)?;
-            replace_file_with_backup(backup_root, &paths.home, &paths.claude_config, &content)
+            if expected.as_deref() == Some(content.as_slice()) {
+                return Ok(McpApplyResult::default());
+            }
+            let installed_sha256 = hash_bytes(&content);
+            let backup = replace_file_with_backup_if_unchanged(
+                backup_root,
+                &paths.home,
+                &paths.claude_config,
+                expected.as_deref(),
+                &content,
+            )?;
+            Ok(McpApplyResult {
+                config_write: Some(AppliedWrite {
+                    destination: paths.claude_config.clone(),
+                    backup,
+                    installed_sha256: Some(installed_sha256),
+                }),
+                state_write: None,
+            })
         }
         AgentKind::Codex => {
             let path = paths.codex_home.join("config.toml");
+            let expected = read_bytes_if_exists(&path)?;
             let content = write_codex_mcp(&path, mcp)?;
-            replace_file_with_backup(backup_root, &paths.codex_home, &path, &content)
+            if expected.as_deref() == Some(content.as_slice()) {
+                return Ok(McpApplyResult::default());
+            }
+            let installed_sha256 = hash_bytes(&content);
+            let backup = replace_file_with_backup_if_unchanged(
+                backup_root,
+                &paths.codex_home,
+                &path,
+                expected.as_deref(),
+                &content,
+            )?;
+            Ok(McpApplyResult {
+                config_write: Some(AppliedWrite {
+                    destination: path,
+                    backup,
+                    installed_sha256: Some(installed_sha256),
+                }),
+                state_write: None,
+            })
         }
+        AgentKind::Cursor => apply_cursor_mcp(paths, backup_root, mcp, changes),
+    }
+}
+
+fn apply_cursor_mcp(
+    paths: &AgentPaths,
+    backup_root: &Path,
+    mcp: &BTreeMap<String, McpServer>,
+    changes: &[Change],
+) -> Result<McpApplyResult> {
+    let mut state_snapshot = load_cursor_mcp_state(paths)?;
+    let (expected_config, configured) = read_cursor_mcp_snapshot(&paths.cursor_config)?;
+    let project_owned = discover_cursor_project_mcp_names(&paths.cursor_home)?;
+    let mut servers = BTreeMap::new();
+    let mut managed_updates = BTreeSet::new();
+
+    for (name, action) in cursor_mcp_actions(changes) {
+        let server = mcp
+            .get(&name)
+            .with_context(|| format!("manifest MCP `{name}` is missing from mcp/servers.json"))?;
+        if project_owned.contains(&name) {
+            continue;
+        }
+        let eligible = match action {
+            ChangeAction::Add => !configured.contains_key(&name),
+            ChangeAction::ManagedUpdate => configured.get(&name).is_some_and(|current| {
+                cursor_mcp_value_sha256(current)
+                    .ok()
+                    .as_ref()
+                    .is_some_and(|current_sha256| {
+                        state_snapshot.state.servers.get(&name) == Some(current_sha256)
+                    })
+            }),
+            ChangeAction::Update | ChangeAction::Unchanged | ChangeAction::Skip => false,
+        };
+        if !eligible {
+            continue;
+        }
+        if action == ChangeAction::ManagedUpdate {
+            managed_updates.insert(name.clone());
+        }
+        let installed_sha256 = cursor_mcp_value_sha256(&cursor_mcp_value(server)?)?;
+        state_snapshot
+            .state
+            .servers
+            .insert(name.clone(), installed_sha256);
+        servers.insert(name, server.clone());
+    }
+
+    if servers.is_empty() {
+        return Ok(McpApplyResult::default());
+    }
+
+    let content = render_cursor_mcp_additive_with_updates(
+        &paths.cursor_config,
+        expected_config.as_deref(),
+        &servers,
+        &managed_updates,
+    )?;
+    if expected_config.as_deref() == Some(content.as_slice()) {
+        return Ok(McpApplyResult::default());
+    }
+    let config_installed_sha256 = hash_bytes(&content);
+    let config_backup = replace_file_with_backup_if_unchanged(
+        backup_root,
+        &paths.cursor_home,
+        &paths.cursor_config,
+        expected_config.as_deref(),
+        &content,
+    )?;
+    let config_write = AppliedWrite {
+        destination: paths.cursor_config.clone(),
+        backup: config_backup,
+        installed_sha256: Some(config_installed_sha256),
+    };
+
+    let state_content = render_cursor_mcp_state(&state_snapshot.state)?;
+    let state_write = if state_snapshot.raw.as_deref() == Some(state_content.as_slice()) {
+        None
+    } else {
+        match replace_file_with_backup_if_unchanged(
+            backup_root,
+            &paths.home,
+            &state_snapshot.path,
+            state_snapshot.raw.as_deref(),
+            &state_content,
+        ) {
+            Ok(backup) => Some(AppliedWrite {
+                destination: state_snapshot.path,
+                backup,
+                installed_sha256: Some(hash_bytes(&state_content)),
+            }),
+            Err(error) => {
+                let rollback = rollback_applied_writes(std::slice::from_ref(&config_write));
+                return match rollback {
+                    Ok(()) => Err(error)
+                        .context("write Cursor MCP ownership state; MCP config was rolled back"),
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "write Cursor MCP ownership state failed: {error:#}; MCP config rollback also failed: {rollback_error:#}"
+                    )),
+                };
+            }
+        }
+    };
+
+    Ok(McpApplyResult {
+        config_write: Some(config_write),
+        state_write,
+    })
+}
+
+fn cursor_mcp_actions(changes: &[Change]) -> BTreeMap<String, ChangeAction> {
+    changes
+        .iter()
+        .filter(|change| change.target == AgentKind::Cursor)
+        .filter_map(|change| {
+            change
+                .resource
+                .strip_prefix("Mcp:")
+                .map(|name| (name.to_string(), change.action))
+        })
+        .collect()
+}
+
+fn cursor_mcp_state_path(paths: &AgentPaths) -> PathBuf {
+    paths
+        .home
+        .join(".agent-sync")
+        .join("state")
+        .join("cursor-mcp.json")
+}
+
+fn load_cursor_mcp_state(paths: &AgentPaths) -> Result<CursorMcpStateSnapshot> {
+    let path = cursor_mcp_state_path(paths);
+    ensure_safe_cursor_mcp_state_path(&path)?;
+    let raw = read_bytes_if_exists(&path)?;
+    let state = match raw.as_deref() {
+        Some(raw) => serde_json::from_slice(raw)
+            .with_context(|| format!("parse Cursor MCP ownership state {}", path.display()))?,
+        None => CursorMcpOwnershipState {
+            schema_version: CURSOR_MCP_STATE_SCHEMA_VERSION,
+            destination: paths.cursor_config.clone(),
+            servers: BTreeMap::new(),
+        },
+    };
+    validate_cursor_mcp_state(&state, paths, &path)?;
+    Ok(CursorMcpStateSnapshot { path, raw, state })
+}
+
+fn validate_cursor_mcp_state(
+    state: &CursorMcpOwnershipState,
+    paths: &AgentPaths,
+    path: &Path,
+) -> Result<()> {
+    if state.schema_version != CURSOR_MCP_STATE_SCHEMA_VERSION {
+        bail!(
+            "unsupported Cursor MCP ownership state version {} in {}",
+            state.schema_version,
+            path.display()
+        );
+    }
+    if state.destination != paths.cursor_config {
+        bail!(
+            "refusing to use Cursor MCP ownership state for {}; it records {}",
+            paths.cursor_config.display(),
+            state.destination.display()
+        );
+    }
+    if let Some((name, _)) = state.servers.iter().find(|(_, hash)| !valid_sha256(hash)) {
+        bail!(
+            "Cursor MCP ownership state for `{name}` has an invalid hash in {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_safe_cursor_mcp_state_path(path: &Path) -> Result<()> {
+    let Some(metadata) = symlink_metadata_if_exists(path)? else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to read or replace symlinked Cursor MCP ownership state {}",
+            path.display()
+        );
+    }
+    if !metadata.is_file() {
+        bail!(
+            "Cursor MCP ownership state path {} is not a regular file",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn render_cursor_mcp_state(state: &CursorMcpOwnershipState) -> Result<Vec<u8>> {
+    Ok([serde_json::to_vec_pretty(state)?, b"\n".to_vec()].concat())
+}
+
+fn cursor_mcp_value_sha256(value: &Value) -> Result<String> {
+    Ok(hash_bytes(&serde_json::to_vec(value)?))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn read_bytes_if_exists(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn mcp_destination(paths: &AgentPaths, target: AgentKind) -> PathBuf {
+    match target {
+        AgentKind::Claude => paths.claude_config.clone(),
+        AgentKind::Codex => paths.codex_home.join("config.toml"),
+        AgentKind::Cursor => paths.cursor_config.clone(),
+    }
+}
+
+fn rollback_applied_writes(writes: &[AppliedWrite]) -> Result<()> {
+    let mut errors = Vec::new();
+    for write in writes.iter().rev() {
+        let current_metadata = match fs::symlink_metadata(&write.destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                errors.push(format!(
+                    "refusing to restore {} because the installed path was removed concurrently",
+                    write.destination.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!(
+                    "inspect {} before rollback: {error}",
+                    write.destination.display()
+                ));
+                continue;
+            }
+        };
+        if current_metadata.file_type().is_symlink() {
+            errors.push(format!(
+                "refusing to roll back concurrently replaced symlink {}",
+                write.destination.display()
+            ));
+            continue;
+        }
+        let Some(installed_sha256) = &write.installed_sha256 else {
+            errors.push(format!(
+                "refusing to roll back {} because its installed hash was not recorded",
+                write.destination.display()
+            ));
+            continue;
+        };
+        match hash_path(&write.destination) {
+            Ok(current) if &current == installed_sha256 => {}
+            Ok(_) => {
+                errors.push(format!(
+                    "refusing to overwrite a concurrent edit at {} during rollback",
+                    write.destination.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!(
+                    "hash {} before rollback: {error:#}",
+                    write.destination.display()
+                ));
+                continue;
+            }
+        }
+        let Some(backup) = &write.backup else {
+            if let Err(error) = remove_target_if_unchanged(&write.destination, installed_sha256) {
+                errors.push(format!("remove {}: {error:#}", write.destination.display()));
+            }
+            continue;
+        };
+        if let Err(error) =
+            restore_backup_atomically_if_unchanged(backup, &write.destination, installed_sha256)
+        {
+            errors.push(format!(
+                "restore {} from {}: {error:#}",
+                write.destination.display(),
+                backup.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
     }
 }
 
@@ -402,7 +1049,56 @@ fn agent_root(paths: &AgentPaths, target: AgentKind) -> &Path {
     match target {
         AgentKind::Codex => &paths.codex_home,
         AgentKind::Claude => &paths.claude_home,
+        AgentKind::Cursor => &paths.cursor_home,
     }
+}
+
+fn planned_action(
+    changes: &[Change],
+    target: AgentKind,
+    resource: &Resource,
+) -> Option<ChangeAction> {
+    let label = resource_label(resource);
+    changes
+        .iter()
+        .find(|change| change.target == target && change.resource == label)
+        .map(|change| change.action)
+}
+
+fn update_action_and_destination(
+    changes: &mut [Change],
+    target: AgentKind,
+    resource: &Resource,
+    action: ChangeAction,
+    destination: PathBuf,
+) {
+    let label = resource_label(resource);
+    if let Some(change) = changes
+        .iter_mut()
+        .find(|change| change.target == target && change.resource == label)
+    {
+        change.action = action;
+        change.destination = destination;
+    }
+}
+
+fn refresh_mcp_actions(
+    paths: &AgentPaths,
+    manifest: &Manifest,
+    mcp: &BTreeMap<String, McpServer>,
+    target: AgentKind,
+    changes: &mut [Change],
+) -> Result<()> {
+    for resource in manifest
+        .resources
+        .iter()
+        .filter(|resource| resource.kind == ResourceKind::Mcp && resource.targets.contains(&target))
+    {
+        let action = mcp_change_action(paths, mcp, &resource.name, target)?;
+        let destination = mcp_destination(paths, target);
+        update_action_and_destination(changes, target, resource, action, destination);
+    }
+    Ok(())
 }
 
 fn resource_label(resource: &Resource) -> String {
@@ -427,30 +1123,60 @@ fn mcp_needs_apply(changes: &[Change], target: AgentKind) -> bool {
     changes.iter().any(|change| {
         change.target == target
             && change.resource.starts_with("Mcp:")
-            && matches!(change.action, ChangeAction::Add | ChangeAction::Update)
+            && matches!(
+                change.action,
+                ChangeAction::Add | ChangeAction::Update | ChangeAction::ManagedUpdate
+            )
     })
 }
 
 fn update_mcp_backup(changes: &mut [Change], target: AgentKind, backup: Option<PathBuf>) {
     for change in changes {
-        if change.target == target && change.resource.starts_with("Mcp:") {
+        if change.target == target
+            && change.resource.starts_with("Mcp:")
+            && matches!(
+                change.action,
+                ChangeAction::Add | ChangeAction::Update | ChangeAction::ManagedUpdate
+            )
+        {
             change.backup = backup.clone();
             break;
         }
     }
 }
 
-fn dedupe_mcp_changes(changes: Vec<Change>) -> Result<Vec<Change>> {
-    let mut out = Vec::new();
-    let mut seen_mcp = std::collections::BTreeSet::new();
-    for change in changes {
-        if change.resource.starts_with("Mcp:") {
-            let key = change.target;
-            if !seen_mcp.insert(key) {
-                continue;
-            }
-        }
-        out.push(change);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_rule_marker_only_accepts_unmodified_generated_content() {
+        let generated = render_cursor_codex_rule("# Rules\n\nKeep changes scoped.\n");
+        assert!(managed_cursor_rule_is_unmodified(&generated));
+
+        let edited = format!("{generated}\nCursor-owned addition.\n");
+        assert!(!managed_cursor_rule_is_unmodified(&edited));
     }
-    Ok(out)
+
+    #[test]
+    fn exact_legacy_cursor_rule_is_a_managed_upgrade_only_while_unmodified() {
+        let resource = Resource {
+            kind: ResourceKind::Rule,
+            name: "codex-agents".to_string(),
+            source_agent: "codex".to_string(),
+            pack_path: "rules/codex-agents.md".to_string(),
+            sha256: String::new(),
+            targets: vec![AgentKind::Cursor],
+        };
+
+        assert_eq!(
+            cursor_rule_replacement_action(&resource, Some(LEGACY_CURSOR_CODEX_RULE)),
+            ChangeAction::ManagedUpdate
+        );
+        let edited = format!("{LEGACY_CURSOR_CODEX_RULE}Cursor-owned addition.\n");
+        assert_eq!(
+            cursor_rule_replacement_action(&resource, Some(&edited)),
+            ChangeAction::Skip
+        );
+    }
 }

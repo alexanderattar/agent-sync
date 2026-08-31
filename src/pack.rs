@@ -1,13 +1,16 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::{
     adapters::{AgentKind, AgentPaths},
-    discover::discover,
-    fsx::{copy_dir, ensure_dir, hash_path},
+    discover::{discover_agent, discover_shared_agents},
+    fsx::{copy_dir_for_export, copy_file_for_export, ensure_dir, hash_path},
     manifest::{Manifest, Resource, ResourceKind},
-    mcp::{discover_claude_mcp, discover_codex_mcp, save_pack_mcp, McpServer},
+    mcp::{
+        discover_claude_mcp_for_export, discover_codex_mcp_for_export,
+        discover_cursor_mcp_for_export, save_pack_mcp, McpServer,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,11 +18,15 @@ pub enum SourceSelection {
     All,
     Codex,
     Claude,
+    Cursor,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExportOptions {
     pub source: SourceSelection,
+    pub include_references: bool,
+    pub include_mcp: bool,
+    pub mcp_servers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,51 +91,78 @@ pub fn export_pack(
     pack: &Path,
     options: ExportOptions,
 ) -> Result<ExportReport> {
+    require_empty_export_pack(pack)?;
     ensure_dir(pack)?;
+    let references = pack.join("references");
     ensure_dir(&pack.join("skills"))?;
     ensure_dir(&pack.join("rules"))?;
     ensure_dir(&pack.join("mcp"))?;
-    ensure_dir(&pack.join("references"))?;
+    ensure_dir(&references)?;
 
-    let inventory = discover(paths)?;
-    let mut manifest = Manifest::new();
-    let mut chosen_skills: BTreeMap<String, (String, std::path::PathBuf)> = BTreeMap::new();
-
-    if matches!(
+    let codex_inventory = if matches!(
         options.source,
         SourceSelection::All | SourceSelection::Codex
     ) {
-        for skill in inventory.codex.skills {
-            chosen_skills
-                .entry(skill.name)
-                .or_insert(("codex".to_string(), skill.path));
-        }
-        for skill in inventory.shared_agents.skills {
-            chosen_skills
-                .entry(skill.name)
-                .or_insert(("agents".to_string(), skill.path));
-        }
-    }
-    if matches!(
+        Some(discover_agent(paths, AgentKind::Codex, false)?)
+    } else {
+        None
+    };
+    let claude_inventory = if matches!(
         options.source,
         SourceSelection::All | SourceSelection::Claude
     ) {
-        for skill in inventory.claude.skills {
-            match chosen_skills.entry(skill.name.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(("claude".to_string(), skill.path));
-                }
-                std::collections::btree_map::Entry::Occupied(entry) => {
-                    if hash_path(&entry.get().1)? != hash_path(&skill.path)? {
-                        manifest.warnings.push(format!(
-                            "skill `{}` exists in multiple agents; kept {} copy",
-                            skill.name,
-                            entry.get().0
-                        ));
-                    }
-                }
-            }
-        }
+        Some(discover_agent(paths, AgentKind::Claude, false)?)
+    } else {
+        None
+    };
+    let cursor_inventory = if matches!(
+        options.source,
+        SourceSelection::All | SourceSelection::Cursor
+    ) {
+        Some(discover_agent(paths, AgentKind::Cursor, false)?)
+    } else {
+        None
+    };
+    let shared_inventory =
+        if codex_inventory.is_some() || claude_inventory.is_some() || cursor_inventory.is_some() {
+            Some(discover_shared_agents(paths)?)
+        } else {
+            None
+        };
+    let mut manifest = Manifest::new();
+    let mut chosen_skills: BTreeMap<String, (String, std::path::PathBuf)> = BTreeMap::new();
+
+    if let Some(inventory) = codex_inventory {
+        choose_inventory_skills(
+            &mut chosen_skills,
+            &mut manifest.warnings,
+            inventory,
+            "codex",
+        )?;
+    }
+    if let Some(inventory) = cursor_inventory {
+        choose_inventory_skills(
+            &mut chosen_skills,
+            &mut manifest.warnings,
+            inventory,
+            "cursor",
+        )?;
+    }
+    if let Some(inventory) = claude_inventory {
+        choose_inventory_skills(
+            &mut chosen_skills,
+            &mut manifest.warnings,
+            inventory,
+            "claude",
+        )?;
+    }
+    if let Some(inventory) = shared_inventory {
+        choose_inventory_skills(
+            &mut chosen_skills,
+            &mut manifest.warnings,
+            inventory,
+            "agents",
+        )?;
     }
 
     for (name, (source_agent, source_path)) in chosen_skills {
@@ -137,20 +171,24 @@ pub fn export_pack(
             fs::remove_dir_all(&dest)
                 .with_context(|| format!("clear existing exported skill {}", dest.display()))?;
         }
-        copy_dir(&source_path, &dest)?;
+        copy_dir_for_export(&source_path, &dest, &format!("skill `{name}`"))?;
         manifest.resources.push(Resource {
             kind: ResourceKind::Skill,
             name,
             source_agent,
             pack_path: dest.strip_prefix(pack)?.to_string_lossy().to_string(),
             sha256: hash_path(&dest)?,
-            targets: vec![AgentKind::Codex, AgentKind::Claude],
+            targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
         });
     }
 
-    export_rules(paths, pack, options, &mut manifest)?;
-    export_references(paths, pack, options, &mut manifest)?;
-    export_mcp(paths, pack, options, &mut manifest)?;
+    export_rules(paths, pack, &options, &mut manifest)?;
+    if options.include_references {
+        export_references(paths, pack, &options, &mut manifest)?;
+    }
+    if options.include_mcp {
+        export_mcp(paths, pack, &options, &mut manifest)?;
+    }
 
     manifest.save(pack)?;
     Ok(ExportReport {
@@ -160,10 +198,93 @@ pub fn export_pack(
     })
 }
 
+fn require_empty_export_pack(pack: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(pack) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", pack.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "export pack path must be a regular directory, not a symlink or file: {}",
+            pack.display()
+        );
+    }
+
+    for entry in fs::read_dir(pack).with_context(|| format!("read {}", pack.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect export pack entry {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("export pack contains a symlink: {}", path.display());
+        }
+        if matches!(
+            name.to_str(),
+            Some("skills" | "rules" | "mcp" | "references")
+        ) {
+            if !metadata.is_dir() || fs::read_dir(&path)?.next().transpose()?.is_some() {
+                bail!(
+                    "export requires an empty pack; {} already contains data",
+                    path.display()
+                );
+            }
+            continue;
+        }
+        if name == crate::manifest::MANIFEST_FILE {
+            if !metadata.is_file() {
+                bail!(
+                    "export pack manifest is not a regular file: {}",
+                    path.display()
+                );
+            }
+            let manifest = Manifest::load(pack)?;
+            if !manifest.resources.is_empty() || !manifest.warnings.is_empty() {
+                bail!(
+                    "export requires an empty pack; {} already describes resources",
+                    path.display()
+                );
+            }
+            continue;
+        }
+        bail!(
+            "export requires an empty pack; unexpected entry {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn choose_inventory_skills(
+    chosen: &mut BTreeMap<String, (String, std::path::PathBuf)>,
+    warnings: &mut Vec<String>,
+    inventory: crate::discover::AgentInventory,
+    source_agent: &str,
+) -> Result<()> {
+    for skill in inventory.skills {
+        match chosen.entry(skill.name.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((source_agent.to_string(), skill.path));
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if hash_path(&entry.get().1)? != hash_path(&skill.path)? {
+                    warnings.push(format!(
+                        "skill `{}` exists in multiple agents; kept {} copy",
+                        skill.name,
+                        entry.get().0
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn export_rules(
     paths: &AgentPaths,
     pack: &Path,
-    options: ExportOptions,
+    options: &ExportOptions,
     manifest: &mut Manifest,
 ) -> Result<()> {
     if matches!(
@@ -173,24 +294,26 @@ fn export_rules(
         let source = paths.codex_home.join("AGENTS.md");
         if source.exists() {
             let dest = pack.join("rules").join("codex-agents.md");
-            fs::copy(&source, &dest)
-                .with_context(|| format!("copy {} to {}", source.display(), dest.display()))?;
+            copy_file_for_export(&source, &dest, "Codex agent rules")?;
             manifest.resources.push(Resource {
                 kind: ResourceKind::Rule,
                 name: "codex-agents".to_string(),
                 source_agent: "codex".to_string(),
                 pack_path: dest.strip_prefix(pack)?.to_string_lossy().to_string(),
                 sha256: hash_path(&dest)?,
-                targets: vec![AgentKind::Codex, AgentKind::Claude],
+                targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
             });
         }
     }
 
-    if matches!(options.source, SourceSelection::Claude) {
+    if matches!(
+        options.source,
+        SourceSelection::All | SourceSelection::Claude
+    ) {
         let source = paths.claude_home.join("CLAUDE.md");
         if source.exists() {
             let dest = pack.join("rules").join("claude-user.md");
-            fs::copy(&source, &dest)?;
+            copy_file_for_export(&source, &dest, "Claude user rules")?;
             manifest.resources.push(Resource {
                 kind: ResourceKind::Rule,
                 name: "claude-user".to_string(),
@@ -201,13 +324,22 @@ fn export_rules(
             });
         }
     }
+    if matches!(
+        options.source,
+        SourceSelection::All | SourceSelection::Cursor
+    ) {
+        manifest.warnings.push(
+            "Cursor rules stay Cursor-owned because their semantics do not map safely to Codex or Claude Code"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
 fn export_references(
     paths: &AgentPaths,
     pack: &Path,
-    options: ExportOptions,
+    options: &ExportOptions,
     manifest: &mut Manifest,
 ) -> Result<()> {
     if matches!(
@@ -220,7 +352,7 @@ fn export_references(
             if dest.exists() {
                 fs::remove_dir_all(&dest)?;
             }
-            copy_dir(&memories, &dest)?;
+            copy_dir_for_export(&memories, &dest, "Codex memory references")?;
             manifest.resources.push(Resource {
                 kind: ResourceKind::MemoryReference,
                 name: "codex-memories".to_string(),
@@ -237,7 +369,7 @@ fn export_references(
             if dest.exists() {
                 fs::remove_dir_all(&dest)?;
             }
-            copy_dir(&automations, &dest)?;
+            copy_dir_for_export(&automations, &dest, "Codex automation references")?;
             manifest.resources.push(Resource {
                 kind: ResourceKind::AutomationTemplate,
                 name: "codex-automations".to_string(),
@@ -254,7 +386,7 @@ fn export_references(
 fn export_mcp(
     paths: &AgentPaths,
     pack: &Path,
-    options: ExportOptions,
+    options: &ExportOptions,
     manifest: &mut Manifest,
 ) -> Result<()> {
     let mut servers: BTreeMap<String, McpServer> = BTreeMap::new();
@@ -262,7 +394,13 @@ fn export_mcp(
         options.source,
         SourceSelection::All | SourceSelection::Codex
     ) {
-        for (name, server) in discover_codex_mcp(&paths.codex_home.join("config.toml"))? {
+        for (name, server) in discover_codex_mcp_for_export(
+            &paths.codex_home.join("config.toml"),
+            &options.mcp_servers,
+        )? {
+            if !mcp_selected(options, &name) {
+                continue;
+            }
             servers.entry(name).or_insert(server);
         }
     }
@@ -270,7 +408,22 @@ fn export_mcp(
         options.source,
         SourceSelection::All | SourceSelection::Claude
     ) {
-        for (name, server) in discover_claude_mcp(&paths.claude_config)? {
+        for (name, server) in
+            discover_claude_mcp_for_export(&paths.claude_config, &options.mcp_servers)?
+        {
+            if !mcp_selected(options, &name) {
+                continue;
+            }
+            servers.entry(name).or_insert(server);
+        }
+    }
+    if matches!(
+        options.source,
+        SourceSelection::All | SourceSelection::Cursor
+    ) {
+        for (name, server) in
+            discover_cursor_mcp_for_export(&paths.cursor_config, &options.mcp_servers)?
+        {
             servers.entry(name).or_insert(server);
         }
     }
@@ -286,8 +439,12 @@ fn export_mcp(
             source_agent: "mixed".to_string(),
             pack_path: "mcp/servers.json".to_string(),
             sha256: hash_path(&mcp_path)?,
-            targets: vec![AgentKind::Codex, AgentKind::Claude],
+            targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
         });
     }
     Ok(())
+}
+
+fn mcp_selected(options: &ExportOptions, name: &str) -> bool {
+    options.mcp_servers.is_empty() || options.mcp_servers.iter().any(|selected| selected == name)
 }
