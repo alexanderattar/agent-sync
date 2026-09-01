@@ -1248,19 +1248,28 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &StatusApp) {
 }
 
 fn render_health(frame: &mut Frame<'_>, area: Rect, health: HealthState) {
-    let (label, tone) = match health {
-        HealthState::Healthy => ("HEALTHY", Tone::Healthy),
-        HealthState::Attention => ("ATTENTION", Tone::Attention),
-        HealthState::Error => ("ERROR", Tone::Error),
-        HealthState::Unknown => ("UNKNOWN", Tone::Muted),
+    let status = match health {
+        HealthState::Healthy => vec![Span::styled(
+            "HEALTHY",
+            style(Tone::Healthy).add_modifier(Modifier::BOLD),
+        )],
+        HealthState::Attention => vec![
+            Span::styled("HEALTHY", style(Tone::Healthy).add_modifier(Modifier::BOLD)),
+            Span::styled(" · ", style(Tone::Muted)),
+            Span::styled("NOTE", style(Tone::Attention).add_modifier(Modifier::BOLD)),
+        ],
+        HealthState::Error => vec![Span::styled(
+            "ERROR",
+            style(Tone::Error).add_modifier(Modifier::BOLD),
+        )],
+        HealthState::Unknown => vec![Span::styled(
+            "UNKNOWN",
+            style(Tone::Muted).add_modifier(Modifier::BOLD),
+        )],
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("health ", style(Tone::Muted)),
-            Span::styled(label, style(tone).add_modifier(Modifier::BOLD)),
-        ])),
-        area,
-    );
+    let mut line = vec![Span::styled("health ", style(Tone::Muted))];
+    line.extend(status);
+    frame.render_widget(Paragraph::new(Line::from(line)), area);
 }
 
 fn render_summary(frame: &mut Frame<'_>, area: Rect, summary: &[StatusLine]) {
@@ -1682,6 +1691,24 @@ mod tests {
         assert!(text.contains("No status details available."));
         assert!(text.contains("No actions available."));
         assert!(text.contains("Managed config is unreadable."));
+    }
+
+    #[test]
+    fn status_renders_advisory_warnings_as_healthy_notes() {
+        let app = App::new(TuiRequest::Status(StatusScreen {
+            source: Some(Agent::Codex),
+            targets: vec![Agent::Cursor],
+            health: HealthState::Attention,
+            summary: Vec::new(),
+            actions: Vec::new(),
+            message: Some("20 target-owned resource(s) are intentionally preserved".into()),
+        }));
+
+        let text = render_text(app, 80, 24);
+
+        assert!(text.contains("HEALTHY · NOTE"), "{text}");
+        assert!(!text.contains("ATTENTION"), "{text}");
+        assert!(text.contains("20 target-owned resource(s) are intentionally preserved"));
     }
 
     #[test]
