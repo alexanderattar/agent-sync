@@ -629,7 +629,7 @@ fn add_schedule_action(
         actions.push(ActionItem {
             id: "schedule-disable".to_string(),
             label: "Disable background sync".to_string(),
-            detail: "Preview removal of the managed daily job; keep its logs.".to_string(),
+            detail: "Preview removal of the managed daily job.".to_string(),
             tone: Tone::Muted,
         });
     } else if has_successful_sync && schedule.action != ScheduleAction::Conflict {
