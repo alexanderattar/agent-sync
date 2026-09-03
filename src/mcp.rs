@@ -44,7 +44,8 @@ enum JsonMcpFlavor {
     Cursor,
 }
 
-pub(crate) type CursorMcpSnapshot = (Option<Vec<u8>>, BTreeMap<String, Value>);
+pub(crate) type JsonMcpSnapshot = (Option<Vec<u8>>, BTreeMap<String, Value>);
+pub(crate) type CursorMcpSnapshot = JsonMcpSnapshot;
 
 pub fn discover_claude_mcp(path: &Path) -> Result<BTreeMap<String, McpServer>> {
     discover_claude_mcp_with_policy(path, None)
@@ -203,17 +204,25 @@ pub(crate) fn discover_cursor_mcp_values(path: &Path) -> Result<BTreeMap<String,
 }
 
 pub(crate) fn read_cursor_mcp_snapshot(path: &Path) -> Result<CursorMcpSnapshot> {
-    ensure_cursor_mcp_write_safe(path)?;
+    read_json_mcp_snapshot(path, "Cursor")
+}
+
+pub(crate) fn read_claude_mcp_snapshot(path: &Path) -> Result<JsonMcpSnapshot> {
+    read_json_mcp_snapshot(path, "Claude")
+}
+
+fn read_json_mcp_snapshot(path: &Path, agent: &str) -> Result<JsonMcpSnapshot> {
+    ensure_json_mcp_write_safe(path, agent)?;
     let raw = match fs::read(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok((None, BTreeMap::new())),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
-    let values = cursor_mcp_values_from_bytes(path, &raw)?;
+    let values = json_mcp_values_from_bytes(path, &raw)?;
     Ok((Some(raw), values))
 }
 
-fn cursor_mcp_values_from_bytes(path: &Path, raw: &[u8]) -> Result<BTreeMap<String, Value>> {
+fn json_mcp_values_from_bytes(path: &Path, raw: &[u8]) -> Result<BTreeMap<String, Value>> {
     let root: Value =
         serde_json::from_slice(raw).with_context(|| format!("parse {}", path.display()))?;
     let root = root
@@ -337,41 +346,19 @@ pub fn discover_cursor_effective_mcp_names(
 }
 
 pub fn ensure_cursor_mcp_write_safe(path: &Path) -> Result<()> {
+    ensure_json_mcp_write_safe(path, "Cursor")
+}
+
+fn ensure_json_mcp_write_safe(path: &Path, agent: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "refusing to rewrite symlinked Cursor MCP config {}; update its target explicitly",
+            "refusing to rewrite symlinked {agent} MCP config {}; update its target explicitly",
             path.display()
         ),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
     }
-}
-
-pub fn write_claude_mcp(path: &Path, servers: &BTreeMap<String, McpServer>) -> Result<Vec<u8>> {
-    validate_mcp_servers_for_render(servers)?;
-    let mut root: Value = if path.exists() {
-        serde_json::from_str(&fs::read_to_string(path)?)?
-    } else {
-        json!({})
-    };
-    if !root.is_object() {
-        root = json!({});
-    }
-    let object = root.as_object_mut().expect("object checked");
-    let entry = object.entry("mcpServers").or_insert_with(|| json!({}));
-    if !entry.is_object() {
-        *entry = json!({});
-    }
-    let map = entry.as_object_mut().expect("object checked");
-    for (name, server) in servers {
-        map.insert(
-            name.clone(),
-            mcp_to_claude_value(server)
-                .with_context(|| format!("render MCP server `{name}` for Claude"))?,
-        );
-    }
-    Ok([serde_json::to_vec_pretty(&root)?, b"\n".to_vec()].concat())
 }
 
 pub fn write_codex_mcp(path: &Path, servers: &BTreeMap<String, McpServer>) -> Result<Vec<u8>> {
@@ -461,7 +448,42 @@ pub(crate) fn render_cursor_mcp_additive_with_updates(
     servers: &BTreeMap<String, McpServer>,
     managed_updates: &BTreeSet<String>,
 ) -> Result<Vec<u8>> {
+    render_json_mcp_additive_with_updates(
+        path,
+        existing,
+        servers,
+        managed_updates,
+        JsonMcpFlavor::Cursor,
+    )
+}
+
+pub(crate) fn render_claude_mcp_additive_with_updates(
+    path: &Path,
+    existing: Option<&[u8]>,
+    servers: &BTreeMap<String, McpServer>,
+    managed_updates: &BTreeSet<String>,
+) -> Result<Vec<u8>> {
+    render_json_mcp_additive_with_updates(
+        path,
+        existing,
+        servers,
+        managed_updates,
+        JsonMcpFlavor::Claude,
+    )
+}
+
+fn render_json_mcp_additive_with_updates(
+    path: &Path,
+    existing: Option<&[u8]>,
+    servers: &BTreeMap<String, McpServer>,
+    managed_updates: &BTreeSet<String>,
+    flavor: JsonMcpFlavor,
+) -> Result<Vec<u8>> {
     validate_mcp_servers_for_render(servers)?;
+    let agent = match flavor {
+        JsonMcpFlavor::Claude => "Claude",
+        JsonMcpFlavor::Cursor => "Cursor",
+    };
     let raw = match existing {
         Some(raw) => std::str::from_utf8(raw)
             .with_context(|| format!("{} must contain UTF-8 JSON", path.display()))?,
@@ -473,7 +495,7 @@ pub(crate) fn render_cursor_mcp_additive_with_updates(
     let root_object = root
         .as_object()
         .with_context(|| format!("{} must contain a JSON object", path.display()))?;
-    let cursor_servers = root_object
+    let configured_servers = root_object
         .get("mcpServers")
         .map(|value| {
             value
@@ -483,20 +505,20 @@ pub(crate) fn render_cursor_mcp_additive_with_updates(
         .transpose()?;
     let missing = servers
         .iter()
-        .filter(|(name, _)| cursor_servers.is_none_or(|existing| !existing.contains_key(*name)))
+        .filter(|(name, _)| configured_servers.is_none_or(|existing| !existing.contains_key(*name)))
         .map(|(name, server)| {
             Ok(format!(
                 "{}:{}",
                 serde_json::to_string(name)?,
                 serde_json::to_string(
-                    &mcp_to_cursor_value(server)
-                        .with_context(|| format!("render MCP server `{name}` for Cursor"))?
+                    &mcp_to_json_value(server, flavor)
+                        .with_context(|| format!("render MCP server `{name}` for {agent}"))?
                 )?
             ))
         })
         .collect::<Result<Vec<_>>>()?;
     let root_layout = inspect_json_object(raw, first_non_whitespace(raw)?, Some("mcpServers"))?;
-    let cursor_layout = root_layout
+    let mcp_layout = root_layout
         .property_value
         .as_ref()
         .map(|range| inspect_json_object(raw, range.start, None))
@@ -505,18 +527,17 @@ pub(crate) fn render_cursor_mcp_additive_with_updates(
         .iter()
         .filter_map(|name| servers.get(name).map(|server| (name, server)))
         .map(|(name, server)| {
-            let layout = root_layout
-                .property_value
-                .as_ref()
-                .context("managed Cursor MCP update requires an mcpServers object")?;
+            let layout = root_layout.property_value.as_ref().with_context(|| {
+                format!("managed {agent} MCP update requires an mcpServers object")
+            })?;
             let property = inspect_json_object(raw, layout.start, Some(name))?
                 .property_value
-                .with_context(|| format!("managed Cursor MCP server `{name}` is missing"))?;
+                .with_context(|| format!("managed {agent} MCP server `{name}` is missing"))?;
             Ok((
                 property,
                 serde_json::to_string(
-                    &cursor_mcp_value(server)
-                        .with_context(|| format!("render MCP server `{name}` for Cursor"))?,
+                    &mcp_to_json_value(server, flavor)
+                        .with_context(|| format!("render MCP server `{name}` for {agent}"))?,
                 )?,
             ))
         })
@@ -524,7 +545,7 @@ pub(crate) fn render_cursor_mcp_additive_with_updates(
     replacements.sort_by_key(|(range, _)| range.start);
     for pair in replacements.windows(2) {
         if pair[0].0.end > pair[1].0.start {
-            bail!("managed Cursor MCP update ranges overlap");
+            bail!("managed {agent} MCP update ranges overlap");
         }
     }
 
@@ -533,9 +554,9 @@ pub(crate) fn render_cursor_mcp_additive_with_updates(
     }
 
     let (insertion_at, prefix) = if root_layout.property_value.is_some() {
-        let layout = cursor_layout
+        let layout = mcp_layout
             .as_ref()
-            .context("Cursor mcpServers layout was not inspected")?;
+            .with_context(|| format!("{agent} mcpServers layout was not inspected"))?;
         (
             layout.closing_brace,
             if layout.has_members { "," } else { "" },
@@ -587,6 +608,14 @@ pub(crate) fn cursor_mcp_value(server: &McpServer) -> Result<Value> {
 
 pub(crate) fn cursor_mcp_server(value: &Value) -> Option<McpServer> {
     mcp_from_json_value(value, JsonMcpFlavor::Cursor)
+}
+
+pub(crate) fn claude_mcp_value(server: &McpServer) -> Result<Value> {
+    mcp_to_claude_value(server)
+}
+
+pub(crate) fn claude_mcp_server(value: &Value) -> Option<McpServer> {
+    mcp_from_json_value(value, JsonMcpFlavor::Claude)
 }
 
 struct JsonObjectLayout {
@@ -1596,7 +1625,13 @@ mod tests {
         );
 
         let claude_path = temp.path().join("claude.json");
-        let claude = write_claude_mcp(&claude_path, &from_codex).unwrap();
+        let claude = render_claude_mcp_additive_with_updates(
+            &claude_path,
+            None,
+            &from_codex,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let claude_json: Value = serde_json::from_slice(&claude).unwrap();
         assert_eq!(
             claude_json["mcpServers"]["stdio"]["env"]["API_TOKEN"],
@@ -1631,8 +1666,13 @@ mod tests {
         let from_cursor = discover_cursor_mcp_for_export(&cursor_path, &selected).unwrap();
         assert_eq!(from_cursor, from_codex);
 
-        let claude_from_cursor =
-            write_claude_mcp(&temp.path().join("claude-from-cursor.json"), &from_cursor).unwrap();
+        let claude_from_cursor = render_claude_mcp_additive_with_updates(
+            &temp.path().join("claude-from-cursor.json"),
+            None,
+            &from_cursor,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let claude_from_cursor: Value = serde_json::from_slice(&claude_from_cursor).unwrap();
         assert_eq!(
             claude_from_cursor["mcpServers"]["http"]["headers"]["Authorization"],
@@ -1944,5 +1984,115 @@ mod tests {
             parsed["mcpServers"]["managed"]["args"],
             serde_json::json!(["serve"])
         );
+    }
+
+    #[test]
+    fn claude_mcp_add_and_managed_update_preserve_unmanaged_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claude.json");
+        let original = concat!(
+            "{\n",
+            "  \"theme\": \"\\u0064ark\",\n",
+            "  \"mcpServers\": {\n",
+            "    \"managed\": { \"command\": \"old\", \"args\": [\"serve\"] },\n",
+            "    \"claudeOwned\": {\"command\":\"keep\",\"claudeOnly\":1.2300e+02}\n",
+            "  },\n",
+            "  \"projects\": {\"keep\": true}\n",
+            "}\n",
+        );
+        fs::write(&path, original).unwrap();
+        let servers = BTreeMap::from([
+            (
+                "claudeOwned".to_string(),
+                McpServer {
+                    transport: Some(McpTransport::Stdio),
+                    command: Some("replace-me".to_string()),
+                    ..McpServer::default()
+                },
+            ),
+            (
+                "managed".to_string(),
+                McpServer {
+                    transport: Some(McpTransport::Stdio),
+                    command: Some("new".to_string()),
+                    args: vec!["serve".to_string()],
+                    ..McpServer::default()
+                },
+            ),
+            (
+                "missing".to_string(),
+                McpServer {
+                    transport: Some(McpTransport::Http),
+                    url: Some("https://example.invalid/mcp".to_string()),
+                    bearer_token_env_var: Some("MCP_TOKEN".to_string()),
+                    ..McpServer::default()
+                },
+            ),
+        ]);
+
+        let updated = String::from_utf8(
+            render_claude_mcp_additive_with_updates(
+                &path,
+                Some(original.as_bytes()),
+                &servers,
+                &BTreeSet::from(["managed".to_string()]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(updated.contains("\"theme\": \"\\u0064ark\""));
+        assert!(updated.contains("\"projects\": {\"keep\": true}"));
+        assert!(
+            updated.contains("\"claudeOwned\": {\"command\":\"keep\",\"claudeOnly\":1.2300e+02}")
+        );
+        let parsed = serde_json::from_str::<Value>(&updated).unwrap();
+        assert_eq!(parsed["mcpServers"]["managed"]["command"], "new");
+        assert_eq!(parsed["mcpServers"]["claudeOwned"]["command"], "keep");
+        assert_eq!(
+            parsed["mcpServers"]["missing"]["headers"]["Authorization"],
+            "Bearer ${MCP_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn claude_mcp_snapshot_keeps_exact_bytes_and_rejects_malformed_servers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claude.json");
+        let original = concat!(
+            "{\n",
+            "  \"mcpServers\": {\n",
+            "    \"qmd\": { \"command\": \"custom-qmd\" },\n",
+            "    \"sequential-thinking\": {\"command\":\"custom-thinking\"}\n",
+            "  },\n",
+            "  \"setting\": \"\\u0061\"\n",
+            "}\n",
+        );
+        fs::write(&path, original).unwrap();
+
+        let (raw, servers) = read_claude_mcp_snapshot(&path).unwrap();
+        assert_eq!(raw.as_deref(), Some(original.as_bytes()));
+        assert_eq!(servers["qmd"]["command"], "custom-qmd");
+        assert_eq!(servers["sequential-thinking"]["command"], "custom-thinking");
+
+        fs::write(&path, "{\"mcpServers\":[]}\n").unwrap();
+        let error = read_claude_mcp_snapshot(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("mcpServers must be a JSON object"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_mcp_snapshot_refuses_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("real-claude.json");
+        let path = temp.path().join("claude.json");
+        fs::write(&target, "{\"mcpServers\":{}}\n").unwrap();
+        symlink(&target, &path).unwrap();
+
+        let error = read_claude_mcp_snapshot(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("symlinked Claude MCP config"));
+        assert_eq!(fs::read_to_string(target).unwrap(), "{\"mcpServers\":{}}\n");
     }
 }

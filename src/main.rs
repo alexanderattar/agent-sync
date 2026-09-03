@@ -643,6 +643,19 @@ fn add_schedule_action(
 }
 
 fn inspect_background(context: &AppContext, executable: &Path) -> BackgroundInspection {
+    if cfg!(debug_assertions) && std::env::var_os("AGENT_SYNC_TEST_DISABLE_BACKGROUND").is_some() {
+        return BackgroundInspection {
+            status: BackgroundStatus {
+                supported: false,
+                enabled: false,
+                healthy: None,
+                action: None,
+                detail: "background inspection is disabled for this test process".to_string(),
+                log_dir: None,
+            },
+            report: None,
+        };
+    }
     if !cfg!(target_os = "macos") {
         return BackgroundInspection {
             status: BackgroundStatus {
