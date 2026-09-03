@@ -100,9 +100,16 @@ does not require memorized command lines.
   by default. Their write forms require `--yes`. TUI write actions are explicit,
   and setup and schedule changes have confirmation screens.
 - Existing target content is preserved unless you explicitly enable updates.
-- Existing Cursor-specific skills, rules, MCP entries, project configuration,
-  editor settings, plugins, and sessions are not overwritten. The optional
-  managed history hook is added or repaired without removing unrelated hooks.
+  A preserved conflict does not block unrelated missing resources from being
+  added.
+- Existing Claude Code- and Cursor-specific skills, rules, MCP entries, project
+  configuration, editor settings, plugins, and sessions are not overwritten.
+  The optional managed history hook is added or repaired without removing
+  unrelated hooks.
+- Agent-sync records the Claude Code resources that it adds. Later syncs can
+  update those resources only while their installed content remains unchanged.
+  Pre-existing matching resources are not silently adopted, and manual edits
+  return the resource to Claude Code ownership.
 - Selected MCP definitions keep environment-variable references. Raw bearer
   tokens, API keys, passwords, and private keys are rejected.
 - Managed replacements create backups. Changed or unowned schedule files are

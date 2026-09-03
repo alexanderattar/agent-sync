@@ -7,6 +7,7 @@ mod discover;
 mod fsx;
 mod manifest;
 mod mcp;
+mod ownership;
 mod pack;
 mod schedule;
 pub mod tui;

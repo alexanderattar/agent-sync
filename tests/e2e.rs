@@ -46,6 +46,7 @@ fn run_failure(root: &Path, args: &[&str]) -> String {
 fn run_output(root: &Path, args: &[&str]) -> Output {
     let output = Command::new(bin())
         .env("HOME", root)
+        .env("AGENT_SYNC_TEST_DISABLE_BACKGROUND", "1")
         .args([
             "--home",
             root.to_str().unwrap(),
@@ -1800,7 +1801,7 @@ fn managed_setup_sync_status_and_automation_are_one_command_workflows() {
     let status = run(root, &["status"]);
     assert!(status.contains("Managed route: codex -> cursor"));
     assert!(status.contains("Cursor history: disabled"));
-    assert!(status.contains("Health: healthy"));
+    assert!(status.contains("Health: healthy"), "{status}");
     assert!(status.contains("Drift: 0 add, 0 update"));
 
     let automated = run(root, &["sync", "--yes", "--automation"]);
@@ -2042,7 +2043,7 @@ fn managed_setup_does_not_rewrite_an_unchanged_config() {
 }
 
 #[test]
-fn managed_add_only_policy_blocks_target_replacement_before_writing() {
+fn managed_sync_preserves_claude_conflicts_and_adds_missing_resources() {
     let temp = setup_fixture();
     let root = temp.path();
     let claude_skill = "---\nname: pr-review\ndescription: Claude-owned\n---\n";
@@ -2050,38 +2051,475 @@ fn managed_add_only_policy_blocks_target_replacement_before_writing() {
         &root.join(".claude/skills/pr-review/SKILL.md"),
         claude_skill,
     );
+    let claude_qmd = serde_json::json!({
+        "type": "stdio",
+        "command": "/opt/claude-qmd",
+        "args": ["mcp"],
+        "env": {},
+        "claudeOnly": true
+    });
+    write(
+        &root.join(".claude.json"),
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {"qmd": claude_qmd.clone()},
+                "claudeSpecific": true
+            }))
+            .unwrap()
+        ),
+    );
+
+    run(
+        root,
+        &[
+            "setup",
+            "--from",
+            "codex",
+            "--to",
+            "claude",
+            "--mcp-servers",
+            "qmd,example_http",
+            "--yes",
+        ],
+    );
+    let preview = run(root, &["sync"]);
+    assert!(
+        preview.contains("Preserved target-owned resources:"),
+        "{preview}"
+    );
+    assert!(preview.contains("- claude Skill:pr-review"), "{preview}");
+    assert!(
+        preview.contains("Add claude Skill:shared-style"),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("Add claude Rule:codex-agents"),
+        "{preview}"
+    );
+    assert!(preview.contains("- claude Mcp:qmd"), "{preview}");
+    assert!(preview.contains("Add claude Mcp:example_http"), "{preview}");
+    assert!(!preview.contains("This plan is blocked"), "{preview}");
+
+    let applied = run(root, &["sync", "--yes"]);
+    assert!(applied.contains("Verification passed"), "{applied}");
+    assert_eq!(
+        fs::read_to_string(root.join(".claude/skills/pr-review/SKILL.md")).unwrap(),
+        claude_skill
+    );
+    assert!(root.join(".claude/skills/shared-style/SKILL.md").is_file());
+    assert!(root
+        .join(".claude/rules/imported-codex-agents.md")
+        .is_file());
+    let claude: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(claude["mcpServers"]["qmd"], claude_qmd);
+    assert_eq!(claude["claudeSpecific"], true);
+    assert_eq!(
+        claude["mcpServers"]["example_http"]["url"],
+        "https://mcp.example.invalid/mcp"
+    );
+    assert!(root.join(".agent-sync/state/last-success.json").is_file());
+
+    let status: Value = serde_json::from_str(&run(root, &["status", "--format", "json"])).unwrap();
+    assert_eq!(status["healthy"], true, "{status:#}");
+    assert_eq!(status["drift"]["add"], 0);
+    assert_eq!(status["drift"]["update"], 0);
+    assert!(status["drift"]["preserved"].as_u64().unwrap() >= 2);
+    assert_eq!(status["next_action"], "none");
+
+    let doctor = run_output(root, &["doctor"]);
+    assert!(
+        doctor.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&doctor.stdout).contains("intentionally preserved"),
+        "{}",
+        String::from_utf8_lossy(&doctor.stdout)
+    );
+    assert_eq!(
+        run(root, &["sync", "--yes", "--automation"]),
+        "DONT_NOTIFY\n"
+    );
+}
+
+#[test]
+fn managed_sync_reuses_existing_claude_codex_rule_destination() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let legacy_rule = "# Claude-specific Codex guidance\n\nKeep this rule.\n";
+    let legacy_path = root.join(".claude/rules/codex-global-agent-rules.md");
+    write(&legacy_path, legacy_rule);
 
     run(
         root,
         &["setup", "--from", "codex", "--to", "claude", "--yes"],
     );
     let preview = run(root, &["sync"]);
-    assert!(preview.contains("Update claude Skill:pr-review"));
-    assert!(preview.contains("This plan is blocked"));
+    assert!(preview.contains("- claude Rule:codex-agents"), "{preview}");
 
-    let error = run_failure(root, &["sync", "--yes"]);
-    assert!(error.contains("sync is blocked"));
+    let applied = run(root, &["sync", "--yes"]);
+    assert!(applied.contains("Verification passed"), "{applied}");
+    assert_eq!(fs::read_to_string(&legacy_path).unwrap(), legacy_rule);
+    assert!(!root.join(".claude/rules/imported-codex-agents.md").exists());
+}
+
+#[test]
+fn moved_managed_claude_rule_is_preserved_without_blocking_additions() {
+    let temp = setup_fixture();
+    let root = temp.path();
+
+    run(
+        root,
+        &["setup", "--from", "codex", "--to", "claude", "--yes"],
+    );
+    run(root, &["sync", "--yes"]);
+    let imported = root.join(".claude/rules/imported-codex-agents.md");
+    let legacy = root.join(".claude/rules/codex-global-agent-rules.md");
+    let original_rule = fs::read_to_string(&imported).unwrap();
+    fs::rename(&imported, &legacy).unwrap();
+    write(
+        &root.join(".codex/AGENTS.md"),
+        "# Global Agent Rules\n\n- Changed after the move.\n",
+    );
+    write(
+        &root.join(".codex/skills/late-skill/SKILL.md"),
+        "---\nname: late-skill\ndescription: Added later\n---\n\n# Late Skill\n",
+    );
+
+    let preview = run(root, &["sync"]);
+    assert!(preview.contains("- claude Rule:codex-agents"), "{preview}");
+    assert!(preview.contains("Add claude Skill:late-skill"), "{preview}");
+
+    let applied = run(root, &["sync", "--yes"]);
+    assert!(applied.contains("Verification passed"), "{applied}");
+    assert_eq!(fs::read_to_string(&legacy).unwrap(), original_rule);
+    assert!(!imported.exists());
+    assert!(root.join(".claude/skills/late-skill/SKILL.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_sync_preserves_a_symlinked_claude_skill() {
+    use std::os::unix::fs::symlink;
+
+    let temp = setup_fixture();
+    let root = temp.path();
+    let victim = root.join("claude-owned-pr-review");
+    let victim_skill =
+        "---\nname: pr-review\ndescription: Claude-owned\n---\n\n# Keep this skill\n";
+    write(&victim.join("SKILL.md"), victim_skill);
+    let link = root.join(".claude/skills/pr-review");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    symlink(&victim, &link).unwrap();
+
+    run(
+        root,
+        &["setup", "--from", "codex", "--to", "claude", "--yes"],
+    );
+    let preview = run(root, &["sync"]);
+    assert!(preview.contains("- claude Skill:pr-review"), "{preview}");
+    assert!(
+        preview.contains("Add claude Skill:shared-style"),
+        "{preview}"
+    );
+
+    let applied = run(root, &["sync", "--yes"]);
+    assert!(applied.contains("Verification passed"), "{applied}");
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::read_to_string(victim.join("SKILL.md")).unwrap(),
+        victim_skill
+    );
+    assert!(root.join(".claude/skills/shared-style/SKILL.md").is_file());
+}
+
+#[test]
+fn managed_claude_resources_update_from_recorded_state() {
+    let temp = setup_fixture();
+    let root = temp.path();
+
+    run(
+        root,
+        &[
+            "setup",
+            "--from",
+            "codex",
+            "--to",
+            "claude",
+            "--mcp-servers",
+            "qmd",
+            "--yes",
+        ],
+    );
+    run(root, &["sync", "--yes"]);
+
+    write(
+        &root.join(".codex/skills/pr-review/SKILL.md"),
+        "---\nname: pr-review\ndescription: Review PRs\n---\n\n# PR Review v2\n",
+    );
+    write(
+        &root.join(".codex/AGENTS.md"),
+        "# Global Agent Rules\n\n- Keep changes scoped.\n- Use focused tests.\n",
+    );
+    write(
+        &root.join(".codex/config.toml"),
+        "[mcp_servers.qmd]\ncommand = \"/opt/qmd-v2\"\nargs = [\"mcp\", \"--new\"]\n",
+    );
+
+    let preview = run(root, &["sync"]);
+    assert!(
+        preview.contains("ManagedUpdate claude Skill:pr-review"),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("ManagedUpdate claude Rule:codex-agents"),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("ManagedUpdate claude Mcp:qmd"),
+        "{preview}"
+    );
+    assert!(!preview.contains("This plan is blocked"), "{preview}");
+
+    let applied = run(root, &["sync", "--yes"]);
+    assert!(applied.contains("Verification passed"), "{applied}");
+    assert!(
+        fs::read_to_string(root.join(".claude/skills/pr-review/SKILL.md"))
+            .unwrap()
+            .contains("# PR Review v2")
+    );
+    assert!(
+        fs::read_to_string(root.join(".claude/rules/imported-codex-agents.md"))
+            .unwrap()
+            .contains("Use focused tests.")
+    );
+    let claude: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(claude["mcpServers"]["qmd"]["command"], "/opt/qmd-v2");
+    assert_eq!(
+        claude["mcpServers"]["qmd"]["args"],
+        serde_json::json!(["mcp", "--new"])
+    );
+}
+
+#[test]
+fn manual_claude_edits_are_preserved_without_starving_new_adds() {
+    let temp = setup_fixture();
+    let root = temp.path();
+
+    run(
+        root,
+        &[
+            "setup",
+            "--from",
+            "codex",
+            "--to",
+            "claude",
+            "--mcp-servers",
+            "qmd",
+            "--yes",
+        ],
+    );
+    run(root, &["sync", "--yes"]);
+
+    let edited_skill = "---\nname: pr-review\ndescription: Claude edit\n---\n\n# Keep this edit\n";
+    write(
+        &root.join(".claude/skills/pr-review/SKILL.md"),
+        edited_skill,
+    );
+    let edited_rule = "# Claude-specific imported rules\n\nKeep this edit.\n";
+    write(
+        &root.join(".claude/rules/imported-codex-agents.md"),
+        edited_rule,
+    );
+    let claude_path = root.join(".claude.json");
+    let mut claude: Value =
+        serde_json::from_str(&fs::read_to_string(&claude_path).unwrap()).unwrap();
+    claude["mcpServers"]["qmd"]["command"] = serde_json::json!("/opt/claude-qmd");
+    let edited_qmd = claude["mcpServers"]["qmd"].clone();
+    write(
+        &claude_path,
+        &format!("{}\n", serde_json::to_string_pretty(&claude).unwrap()),
+    );
+
+    write(
+        &root.join(".codex/skills/late-skill/SKILL.md"),
+        "---\nname: late-skill\ndescription: Added later\n---\n\n# Late Skill\n",
+    );
+    write(
+        &root.join(".codex/config.toml"),
+        "[mcp_servers.qmd]\ncommand = \"/usr/local/bin/qmd\"\nargs = [\"mcp\"]\n\n[mcp_servers.late_mcp]\ncommand = \"/opt/late-mcp\"\nargs = []\n",
+    );
+    run(root, &["setup", "--mcp-servers", "qmd,late_mcp", "--yes"]);
+
+    let preview = run(root, &["sync"]);
+    assert!(
+        preview.contains("Preserved target-owned resources:"),
+        "{preview}"
+    );
+    assert!(preview.contains("- claude Skill:pr-review"), "{preview}");
+    assert!(preview.contains("- claude Rule:codex-agents"), "{preview}");
+    assert!(preview.contains("- claude Mcp:qmd"), "{preview}");
+    assert!(preview.contains("Add claude Skill:late-skill"), "{preview}");
+    assert!(preview.contains("Add claude Mcp:late_mcp"), "{preview}");
+
+    let applied = run(root, &["sync", "--yes"]);
+    assert!(applied.contains("Verification passed"), "{applied}");
     assert_eq!(
         fs::read_to_string(root.join(".claude/skills/pr-review/SKILL.md")).unwrap(),
-        claude_skill
+        edited_skill
     );
-    assert!(!root.join(".claude/skills/shared-style").exists());
-    assert!(!root.join(".agent-sync/state/last-success.json").exists());
-    let attempt: Value = serde_json::from_str(
-        &fs::read_to_string(root.join(".agent-sync/state/last-attempt.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(attempt["result"], "failed");
+    assert_eq!(
+        fs::read_to_string(root.join(".claude/rules/imported-codex-agents.md")).unwrap(),
+        edited_rule
+    );
+    assert!(root.join(".claude/skills/late-skill/SKILL.md").is_file());
+    let claude: Value = serde_json::from_str(&fs::read_to_string(claude_path).unwrap()).unwrap();
+    assert_eq!(claude["mcpServers"]["qmd"], edited_qmd);
+    assert_eq!(claude["mcpServers"]["late_mcp"]["command"], "/opt/late-mcp");
+}
 
-    run(root, &["sync"]);
-    let attempt_after_preview: Value = serde_json::from_str(
-        &fs::read_to_string(root.join(".agent-sync/state/last-attempt.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(attempt_after_preview["run_id"], attempt["run_id"]);
-    let doctor = run_output(root, &["doctor"]);
-    assert!(!doctor.status.success());
-    assert!(String::from_utf8_lossy(&doctor.stdout).contains("latest sync attempt failed"));
+#[test]
+fn preexisting_identical_claude_resources_are_not_adopted() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    let original_skill = fs::read_to_string(root.join(".codex/skills/pr-review/SKILL.md")).unwrap();
+    let original_shared =
+        fs::read_to_string(root.join(".agents/skills/shared-style/SKILL.md")).unwrap();
+    write(
+        &root.join(".claude/skills/pr-review/SKILL.md"),
+        &original_skill,
+    );
+    write(
+        &root.join(".claude/skills/shared-style/SKILL.md"),
+        &original_shared,
+    );
+    let original_source_rule = fs::read_to_string(root.join(".codex/AGENTS.md")).unwrap();
+    let original_rule = format!(
+        "# Imported Codex Agent Rules\n\nImported by `agent-sync` from pack resource `codex-agents`.\n\n{original_source_rule}"
+    );
+    write(
+        &root.join(".claude/rules/imported-codex-agents.md"),
+        &original_rule,
+    );
+    let original_qmd = serde_json::json!({
+        "type": "stdio",
+        "command": "/usr/local/bin/qmd",
+        "args": ["mcp"],
+        "env": {}
+    });
+    write(
+        &root.join(".claude.json"),
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {"qmd": original_qmd.clone()}
+            }))
+            .unwrap()
+        ),
+    );
+
+    run(
+        root,
+        &[
+            "setup",
+            "--from",
+            "codex",
+            "--to",
+            "claude",
+            "--mcp-servers",
+            "qmd",
+            "--yes",
+        ],
+    );
+    let initial_pack = root.join("preexisting-identical-pack");
+    run(
+        root,
+        &[
+            "export",
+            "--pack",
+            initial_pack.to_str().unwrap(),
+            "--from",
+            "codex",
+            "--portable-only",
+            "--mcp-servers",
+            "qmd",
+        ],
+    );
+    let first_preview = run(
+        root,
+        &[
+            "diff",
+            "--pack",
+            initial_pack.to_str().unwrap(),
+            "--targets",
+            "claude",
+        ],
+    );
+    assert!(
+        first_preview.contains("Unchanged claude Skill:pr-review"),
+        "{first_preview}"
+    );
+    assert!(
+        first_preview.contains("Unchanged claude Rule:codex-agents"),
+        "{first_preview}"
+    );
+    assert!(
+        first_preview.contains("Unchanged claude Mcp:qmd"),
+        "{first_preview}"
+    );
+    run(root, &["sync", "--yes"]);
+    assert!(!root
+        .join(".agent-sync/state/claude-resources.json")
+        .exists());
+    assert!(!root.join(".agent-sync/state/claude-mcp.json").exists());
+
+    write(
+        &root.join(".codex/skills/pr-review/SKILL.md"),
+        "---\nname: pr-review\ndescription: Review PRs\n---\n\n# Changed source\n",
+    );
+    write(
+        &root.join(".codex/AGENTS.md"),
+        "# Global Agent Rules\n\n- Changed source.\n",
+    );
+    write(
+        &root.join(".codex/config.toml"),
+        "[mcp_servers.qmd]\ncommand = \"/opt/qmd-v2\"\nargs = [\"mcp\"]\n",
+    );
+
+    let changed_preview = run(root, &["sync"]);
+    assert!(
+        changed_preview.contains("- claude Skill:pr-review"),
+        "{changed_preview}"
+    );
+    assert!(
+        changed_preview.contains("- claude Rule:codex-agents"),
+        "{changed_preview}"
+    );
+    assert!(
+        changed_preview.contains("- claude Mcp:qmd"),
+        "{changed_preview}"
+    );
+    run(root, &["sync", "--yes"]);
+
+    assert_eq!(
+        fs::read_to_string(root.join(".claude/skills/pr-review/SKILL.md")).unwrap(),
+        original_skill
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".claude/rules/imported-codex-agents.md")).unwrap(),
+        original_rule
+    );
+    let claude: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(claude["mcpServers"]["qmd"], original_qmd);
 }
 
 #[test]
@@ -2322,11 +2760,8 @@ fn unsafe_manifest_resource_names_are_rejected_before_apply() {
     assert!(!root.join("escaped").exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn apply_rolls_back_completed_writes_when_a_later_resource_fails() {
-    use std::os::unix::fs::symlink;
-
     let temp = setup_fixture();
     let root = temp.path();
     let pack = root.join("rollback-pack");
@@ -2350,14 +2785,8 @@ fn apply_rolls_back_completed_writes_when_a_later_resource_fails() {
         &root.join(".claude/skills/pr-review/user-note.txt"),
         "keep this user file\n",
     );
-    let user_skill = root.join("user-owned-shared-style");
-    write(
-        &user_skill.join("SKILL.md"),
-        "---\nname: shared-style\ndescription: User owned\n---\n",
-    );
-    fs::create_dir_all(root.join(".claude/skills")).unwrap();
-    let linked_skill = root.join(".claude/skills/shared-style");
-    symlink(&user_skill, &linked_skill).unwrap();
+    let invalid_mcp_state = root.join(".agent-sync/state/claude-mcp.json");
+    write(&invalid_mcp_state, "not valid JSON\n");
 
     let error = run_failure(
         root,
@@ -2380,13 +2809,12 @@ fn apply_rolls_back_completed_writes_when_a_later_resource_fails() {
         fs::read_to_string(root.join(".claude/skills/pr-review/user-note.txt")).unwrap(),
         "keep this user file\n"
     );
-    assert!(fs::symlink_metadata(&linked_skill)
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    assert!(fs::read_to_string(user_skill.join("SKILL.md"))
-        .unwrap()
-        .contains("User owned"));
+    assert!(!root.join(".claude/skills/shared-style").exists());
+    assert!(!root.join(".claude/rules/imported-codex-agents.md").exists());
+    assert_eq!(
+        fs::read_to_string(invalid_mcp_state).unwrap(),
+        "not valid JSON\n"
+    );
 }
 
 #[cfg(unix)]
@@ -2605,7 +3033,7 @@ fn managed_status_json_has_stable_health_and_background_fields() {
     assert_eq!(status["source"], "codex");
     assert_eq!(status["configured"], true);
     assert_eq!(status["cursor_history"], "disabled");
-    assert_eq!(status["healthy"], true);
+    assert_eq!(status["healthy"], true, "{status:#}");
     assert!(status["drift"].is_object());
     assert!(status["background"]["supported"].is_boolean());
     assert!(status["background"]["detail"].is_string());

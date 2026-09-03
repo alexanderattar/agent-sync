@@ -16,7 +16,10 @@ use crate::{
         install_agent_skills, AgentSkillInstallAction, AgentSkillInstallOptions,
         AgentSkillInstallSetReport,
     },
-    apply::{apply_pack, diff_pack, verify_pack, ApplyOptions, Change, ChangeAction},
+    apply::{
+        apply_pack, diff_pack_with_policy, verify_pack_with_policy, ApplyOptions, Change,
+        ChangeAction,
+    },
     config::{load_config, render_config, CanonicalSource, Config, McpMode},
     cursor_history::{
         cursor_history_coverage_at, cursor_history_unreadable_count,
@@ -646,7 +649,7 @@ fn sync_inner(
     let manifest_sha256 = hash_path(&pack.join("agent-sync.manifest.json"))?;
     progress.manifest_sha256 = Some(manifest_sha256.clone());
     progress.phase = "diff";
-    let changes = diff_pack(paths, pack, &config.targets)?;
+    let changes = diff_pack_with_policy(paths, pack, &config.targets, config.allow_updates)?;
     let before = ChangeCounts::from_changes(&changes);
     progress.before = before;
     let preserved = changes
@@ -796,7 +799,7 @@ fn sync_inner(
     progress.apply_completed = true;
     progress.backup_root = applied.backup_root.clone();
     progress.phase = "verify";
-    let verification = verify_pack(paths, pack, &config.targets)?;
+    let verification = verify_pack_with_policy(paths, pack, &config.targets, config.allow_updates)?;
     if !verification.ok {
         bail!(
             "post-sync verification failed: {}",
@@ -804,7 +807,7 @@ fn sync_inner(
         );
     }
     progress.verification_ok = true;
-    let final_changes = diff_pack(paths, pack, &config.targets)?;
+    let final_changes = diff_pack_with_policy(paths, pack, &config.targets, config.allow_updates)?;
     let after = ChangeCounts::from_changes(&final_changes);
     progress.after = after;
     let final_preserved = final_changes
@@ -1423,7 +1426,7 @@ fn current_changes(paths: &AgentPaths, config: &Config) -> Result<Vec<Change>> {
         .tempdir()
         .context("create private status pack")?;
     export_pack(paths, temp.path(), export_options(config))?;
-    diff_pack(paths, temp.path(), &config.targets)
+    diff_pack_with_policy(paths, temp.path(), &config.targets, config.allow_updates)
 }
 
 fn export_options(config: &Config) -> ExportOptions {
