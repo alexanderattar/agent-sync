@@ -1826,6 +1826,86 @@ fn doctor_rejects_missing_run_history_after_a_successful_sync() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn qmd_refresh_failure_does_not_starve_agent_sync() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = setup_fixture();
+    let root = temp.path();
+    let qmd = root.join(".local/bin/qmd");
+    write(
+        &qmd,
+        r#"#!/bin/sh
+case "$1" in
+collection)
+    printf 'Path: %s/.agent-sync/history/cursor\nPattern: **/*.md\nInclude: yes (default)\n' "$HOME"
+    ;;
+status) printf 'Pending: 0 need embedding\n' ;;
+update)
+    if [ -e "$HOME/fail-qmd-update" ]; then
+        echo 'unrelated collection is unreadable' >&2
+        exit 9
+    fi
+    ;;
+embed) ;;
+*) exit 8 ;;
+esac
+"#,
+    );
+    fs::set_permissions(&qmd, fs::Permissions::from_mode(0o755)).unwrap();
+    run(
+        root,
+        &[
+            "setup",
+            "--to",
+            "claude,cursor",
+            "--cursor-history",
+            "--refresh-qmd",
+            "--yes",
+        ],
+    );
+    run(root, &["sync", "--yes"]);
+    let success_path = root.join(".agent-sync/state/last-success.json");
+    let previous_success = fs::read(&success_path).unwrap();
+
+    let skill = "---\nname: late-skill\ndescription: Added after the last sync\n---\n\nNew shared guidance.\n";
+    write(&root.join(".codex/skills/late-skill/SKILL.md"), skill);
+    write(&root.join("fail-qmd-update"), "");
+    let error = run_failure(root, &["sync", "--yes", "--automation"]);
+    assert!(error.contains("qmd update failed"), "{error}");
+    assert_eq!(
+        fs::read_to_string(root.join(".claude/skills/late-skill/SKILL.md")).unwrap(),
+        skill
+    );
+    let attempt: Value = serde_json::from_slice(
+        &fs::read(root.join(".agent-sync/state/last-attempt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(attempt["result"], "failed");
+    assert_eq!(attempt["applied"], true);
+    assert_eq!(attempt["verification_ok"], true);
+    assert_eq!(attempt["failed_phase"], "qmd-refresh");
+    assert_eq!(attempt["qmd_refreshed"], false);
+    assert_eq!(attempt["after"]["add"], 0);
+    assert_eq!(attempt["after"]["update"], 0);
+    assert_eq!(fs::read(&success_path).unwrap(), previous_success);
+    let doctor = run_output(root, &["doctor"]);
+    assert!(!doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("latest sync attempt failed"));
+
+    fs::remove_file(root.join("fail-qmd-update")).unwrap();
+    run(root, &["sync", "--yes"]);
+    let success: Value = serde_json::from_slice(&fs::read(&success_path).unwrap()).unwrap();
+    assert_ne!(success["run_id"], attempt["run_id"]);
+    assert_eq!(success["verification_ok"], true);
+    assert_eq!(success["qmd_refreshed"], true);
+    assert_eq!(
+        run(root, &["sync", "--yes", "--automation"]),
+        "DONT_NOTIFY\n"
+    );
+}
+
 #[test]
 fn doctor_rejects_missing_last_attempt_after_a_successful_sync() {
     let temp = setup_fixture();
@@ -1959,14 +2039,75 @@ fn managed_setup_does_not_adopt_an_identical_user_owned_skill() {
     let user_skill = include_str!("../skills/agent-sync/SKILL.md");
     write(&root.join(".agents/skills/agent-sync/SKILL.md"), user_skill);
 
-    let error = run_failure(root, &["setup", "--yes"]);
+    let output = run(root, &["setup", "--yes"]);
 
-    assert!(error.contains("unmanaged agent-sync skill"));
+    assert!(output.contains("Preserved user-owned bundled agent-sync skill"));
     assert_eq!(
         fs::read_to_string(root.join(".agents/skills/agent-sync/SKILL.md")).unwrap(),
         user_skill
     );
-    assert!(!root.join(".agent-sync/config.toml").exists());
+    assert!(root.join(".agent-sync/config.toml").exists());
+    assert!(!root.join(".agent-sync/state/bundled-skill.json").exists());
+}
+
+#[test]
+fn modified_control_skills_do_not_block_sync_and_only_notify_once() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    run(root, &["setup", "--to", "cursor,claude", "--yes"]);
+    run(root, &["sync", "--yes"]);
+    let shared = root.join(".agents/skills/agent-sync/SKILL.md");
+    let claude = root.join(".claude/skills/agent-sync/SKILL.md");
+    let shared_state = root.join(".agent-sync/state/bundled-skill.json");
+    let claude_state = root.join(".agent-sync/state/bundled-skill-claude.json");
+    let original_shared_state = fs::read(&shared_state).unwrap();
+    let original_claude_state = fs::read(&claude_state).unwrap();
+    let custom =
+        "---\nname: agent-sync\ndescription: Sync my agents\n---\n\nMy custom instructions.\n";
+    fs::write(&shared, custom).unwrap();
+    fs::write(&claude, custom).unwrap();
+    write(
+        &root.join(".codex/skills/daily-work/SKILL.md"),
+        "---\nname: daily-work\ndescription: Daily work\n---\n\nDaily instructions.\n",
+    );
+
+    let preview = run(root, &["sync"]);
+    assert!(preview.contains("user-owned control skill"), "{preview}");
+    let applied = run(root, &["sync", "--yes", "--automation"]);
+    assert!(applied.contains("user-owned control skill"), "{applied}");
+    assert!(root.join(".claude/skills/daily-work/SKILL.md").is_file());
+    assert_eq!(fs::read_to_string(&shared).unwrap(), custom);
+    assert_eq!(fs::read_to_string(&claude).unwrap(), custom);
+    assert_eq!(fs::read(&shared_state).unwrap(), original_shared_state);
+    assert_eq!(fs::read(&claude_state).unwrap(), original_claude_state);
+
+    let record: Value = serde_json::from_slice(
+        &fs::read(root.join(".agent-sync/state/last-success.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["bundled_skill_changed"], false);
+    let doctor = run(root, &["doctor"]);
+    assert!(
+        doctor.contains("user-owned control skill preserved"),
+        "{doctor}"
+    );
+    let status: Value = serde_json::from_str(&run(root, &["status", "--format", "json"])).unwrap();
+    assert_eq!(status["healthy"], true, "{status}");
+    assert!(status["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| {
+            warning
+                .as_str()
+                .unwrap()
+                .contains("user-owned control skill preserved")
+        }));
+    let quiet = run(root, &["sync", "--yes", "--automation"]);
+    assert_eq!(quiet, "DONT_NOTIFY\n");
+    let preview = run(root, &["sync"]);
+    assert!(!preview.contains("refresh the natural-language agent-sync skill"));
+    assert!(!preview.contains("Run `agent-sync sync --yes`"));
 }
 
 #[test]

@@ -1790,6 +1790,22 @@ const SECRET_PREFIXES: &[SecretPrefix] = &[
         minimum_length: 20,
     },
     SecretPrefix {
+        prefix: "gho_",
+        minimum_length: 20,
+    },
+    SecretPrefix {
+        prefix: "ghu_",
+        minimum_length: 20,
+    },
+    SecretPrefix {
+        prefix: "ghs_",
+        minimum_length: 20,
+    },
+    SecretPrefix {
+        prefix: "ghr_",
+        minimum_length: 20,
+    },
+    SecretPrefix {
         prefix: "github_pat_",
         minimum_length: 20,
     },
@@ -2666,6 +2682,57 @@ mod tests {
         assert!(safe_secret_reference_or_placeholder(
             "process.env.GITHUB_TOKEN"
         ));
+    }
+
+    #[test]
+    fn github_oauth_and_app_tokens_are_rejected_before_export() {
+        for prefix in ["gho_", "ghu_", "ghs_", "ghr_"] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("SKILL.md");
+            let destination = temp.path().join("exported.md");
+            let token = format!("{prefix}{}", "0".repeat(36));
+            fs::write(&source, format!("# Example\nUse `{token}`.\n")).unwrap();
+
+            let error = copy_file_for_export(&source, &destination, "example skill")
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("credential-like token"), "{prefix}: {error}");
+            assert!(!error.contains(&token));
+            assert!(!destination.exists());
+            assert!(!safe_secret_reference_or_placeholder(&token));
+        }
+    }
+
+    #[test]
+    fn github_oauth_and_app_tokens_are_redacted_from_history() {
+        for prefix in ["gho_", "ghu_", "ghs_", "ghr_"] {
+            let token = format!("{prefix}{}", "0".repeat(36));
+            let input = format!("Before\nUse `{token}` with GitHub.\nAfter\n");
+
+            let (redacted, count) = redact_known_secrets(&input);
+
+            assert_eq!(count, 1, "{prefix}");
+            assert_eq!(redacted, "Before\nUse `[REDACTED]` with GitHub.\nAfter\n");
+            assert_eq!(raw_secret_reason(&redacted), None);
+        }
+    }
+
+    #[test]
+    fn github_token_documentation_and_environment_references_remain_exportable() {
+        let input = "GitHub uses the prefixes `gho_`, `ghu_`, `ghs_`, and `ghr_`.\n\
+            GITHUB_TOKEN=${GITHUB_TOKEN}\n\
+            API_TOKEN=$GITHUB_TOKEN\n\
+            apiKey = process.env.GITHUB_TOKEN\n";
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("SKILL.md");
+        let destination = temp.path().join("exported.md");
+        fs::write(&source, input).unwrap();
+
+        copy_file_for_export(&source, &destination, "example skill").unwrap();
+
+        assert_eq!(fs::read_to_string(destination).unwrap(), input);
+        assert_eq!(redact_known_secrets(input), (input.to_owned(), 0));
     }
 
     #[test]
