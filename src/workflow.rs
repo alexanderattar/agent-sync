@@ -438,7 +438,7 @@ impl SyncReport {
         } else {
             out.push_str("Preview only. No agent files were changed.\n");
             if self.record.before.has_writes()
-                || self.skill_action != AgentSkillInstallAction::Unchanged
+                || self.skill_action.has_writes()
                 || self.record.history_hook_changed
                 || self.qmd_refresh_enabled
                 || self.cursor_history_sweep_enabled
@@ -482,7 +482,7 @@ impl SyncReport {
                 out.push_str(&format!("- {resource}\n"));
             }
         }
-        if self.skill_action != AgentSkillInstallAction::Unchanged {
+        if self.skill_action.has_writes() {
             if self.record.bundled_skill_changed {
                 out.push_str("The natural-language agent-sync skill was maintained.\n");
             } else {
@@ -652,7 +652,7 @@ fn sync_inner(
     let changes = diff_pack_with_policy(paths, pack, &config.targets, config.allow_updates)?;
     let before = ChangeCounts::from_changes(&changes);
     progress.before = before;
-    let preserved = changes
+    let mut preserved = changes
         .iter()
         .filter(|change| change.action == ChangeAction::Skip)
         .map(|change| format!("{} {}", change.target, change.resource))
@@ -660,6 +660,19 @@ fn sync_inner(
     progress.preserved = preserved.clone();
     progress.phase = "skill-preflight";
     let skill_preview = install_agent_skills(paths, AgentSkillInstallOptions { dry_run: true })?;
+    preserved.extend(
+        skill_preview
+            .installations
+            .iter()
+            .filter(|installation| installation.action == AgentSkillInstallAction::Preserved)
+            .map(|installation| {
+                format!(
+                    "user-owned control skill {}",
+                    installation.destination.display()
+                )
+            }),
+    );
+    progress.preserved = preserved.clone();
     let history_output_dir = config
         .cursor_history
         .enabled
@@ -737,10 +750,9 @@ fn sync_inner(
 
     progress.phase = "skill-reconcile";
     let skill = install_agent_skills(paths, AgentSkillInstallOptions { dry_run: false })?;
-    let bundled_skill_changed = skill.action() != AgentSkillInstallAction::Unchanged;
+    let bundled_skill_changed = skill.action().has_writes();
     progress.bundled_skill_changed = bundled_skill_changed;
 
-    let mut qmd_refreshed = false;
     let mut cursor_history_checked = 0;
     progress.phase = "history-preflight";
     if config.cursor_history.enabled {
@@ -760,16 +772,6 @@ fn sync_inner(
         cursor_history_checked = sweep.exported;
         progress.cursor_history_checked = sweep.exported;
         progress.cursor_history_unreadable = sweep.unreadable.len();
-        if config.cursor_history.refresh_qmd {
-            ensure_qmd_collection(paths, false)?;
-            progress.phase = "qmd-refresh";
-            qmd_refreshed = if progress.cursor_history_unreadable > 0 {
-                refresh_pending_qmd_index_for_output(paths, output_dir, true)?
-            } else {
-                refresh_qmd_index_for_output(paths, output_dir, true)?
-            };
-            progress.qmd_refreshed = qmd_refreshed;
-        }
     } else {
         remove_cursor_history_hook(paths, true)?;
     }
@@ -810,11 +812,23 @@ fn sync_inner(
     let final_changes = diff_pack_with_policy(paths, pack, &config.targets, config.allow_updates)?;
     let after = ChangeCounts::from_changes(&final_changes);
     progress.after = after;
-    let final_preserved = final_changes
+    let mut final_preserved = final_changes
         .iter()
         .filter(|change| change.action == ChangeAction::Skip)
         .map(|change| format!("{} {}", change.target, change.resource))
         .collect::<Vec<_>>();
+    final_preserved.extend(
+        skill
+            .installations
+            .iter()
+            .filter(|installation| installation.action == AgentSkillInstallAction::Preserved)
+            .map(|installation| {
+                format!(
+                    "user-owned control skill {}",
+                    installation.destination.display()
+                )
+            }),
+    );
     progress.preserved = final_preserved.clone();
     if after.has_writes() {
         bail!(
@@ -841,6 +855,20 @@ fn sync_inner(
         remove_cursor_history_hook(paths, false)?.changed
     };
     progress.history_hook_changed = history_hook_changed;
+    let mut qmd_refreshed = false;
+    if config.cursor_history.enabled && config.cursor_history.refresh_qmd {
+        let output_dir = history_output_dir
+            .as_deref()
+            .context("Cursor history output directory was not resolved")?;
+        progress.phase = "qmd-refresh";
+        ensure_qmd_collection(paths, false)?;
+        qmd_refreshed = if progress.cursor_history_unreadable > 0 {
+            refresh_pending_qmd_index_for_output(paths, output_dir, true)?
+        } else {
+            refresh_qmd_index_for_output(paths, output_dir, true)?
+        };
+        progress.qmd_refreshed = qmd_refreshed;
+    }
     let changed = applied_before.has_writes() || bundled_skill_changed || history_hook_changed;
     let updates_allowed = config.allow_updates || plain_update_count(&applied.changes) == 0;
     Ok(SyncReport {
@@ -1033,22 +1061,22 @@ fn doctor_managed_with_config(
     }
 
     match install_agent_skills(paths, AgentSkillInstallOptions { dry_run: true }) {
-        Ok(report) if report.action() == AgentSkillInstallAction::Unchanged => {
-            checks.push("natural-language agent-sync skill is installed".to_string());
+        Ok(report) => {
+            for installation in report.installations {
+                let destination = installation.destination.display();
+                match installation.action {
+                    AgentSkillInstallAction::Unchanged => checks.push(format!(
+                        "natural-language agent-sync skill is installed: {destination}"
+                    )),
+                    AgentSkillInstallAction::Preserved => warnings.push(format!(
+                        "user-owned control skill preserved; bundled updates are not applied: {destination}"
+                    )),
+                    action => errors.push(format!(
+                        "natural-language skill needs {action:?}: {destination}"
+                    )),
+                }
+            }
         }
-        Ok(report) => errors.push(format!(
-            "natural-language skill needs {:?}: {}",
-            report.action(),
-            report
-                .installations
-                .iter()
-                .filter(|installation| {
-                    installation.action != AgentSkillInstallAction::Unchanged
-                })
-                .map(|installation| installation.destination.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
         Err(error) => errors.push(format!("natural-language skill: {error:#}")),
     }
 

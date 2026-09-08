@@ -33,6 +33,13 @@ pub enum AgentSkillInstallAction {
     Add,
     Update,
     Unchanged,
+    Preserved,
+}
+
+impl AgentSkillInstallAction {
+    pub fn has_writes(self) -> bool {
+        matches!(self, Self::Add | Self::Update)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +57,7 @@ impl AgentSkillInstallReport {
             (true, AgentSkillInstallAction::Add) => "Dry run. Add",
             (true, AgentSkillInstallAction::Update) => "Dry run. Update",
             (_, AgentSkillInstallAction::Unchanged) => "Unchanged",
+            (_, AgentSkillInstallAction::Preserved) => "Preserved user-owned",
             (false, AgentSkillInstallAction::Add) => "Installed",
             (false, AgentSkillInstallAction::Update) => "Updated",
         };
@@ -83,6 +91,12 @@ impl AgentSkillInstallSetReport {
             .any(|report| report.action == AgentSkillInstallAction::Add)
         {
             AgentSkillInstallAction::Add
+        } else if self
+            .installations
+            .iter()
+            .any(|report| report.action == AgentSkillInstallAction::Preserved)
+        {
+            AgentSkillInstallAction::Preserved
         } else {
             AgentSkillInstallAction::Unchanged
         }
@@ -252,7 +266,7 @@ fn rollback_install_set(
         .iter()
         .zip(snapshots)
         .rev()
-        .filter(|(report, _)| report.action != AgentSkillInstallAction::Unchanged)
+        .filter(|(report, _)| report.action.has_writes())
         .filter_map(|(_, snapshot)| {
             snapshot.restore().err().map(|error| {
                 format!(
@@ -308,7 +322,7 @@ fn install_agent_skill_at(
         });
     }
 
-    if action == AgentSkillInstallAction::Unchanged {
+    if !action.has_writes() {
         return Ok(AgentSkillInstallReport {
             action,
             dry_run: false,
@@ -349,7 +363,9 @@ fn install_agent_skill_at(
                 BUNDLED_AGENT_SKILL.as_bytes(),
             )?
         }
-        AgentSkillInstallAction::Unchanged => unreachable!("handled above"),
+        AgentSkillInstallAction::Unchanged | AgentSkillInstallAction::Preserved => {
+            unreachable!("handled above")
+        }
     };
 
     if let Err(error) = write_state(&state_path, &destination) {
@@ -396,7 +412,9 @@ fn install_agent_skill_at(
                     }
                 }
             }
-            AgentSkillInstallAction::Unchanged => unreachable!("handled above"),
+            AgentSkillInstallAction::Unchanged | AgentSkillInstallAction::Preserved => {
+                unreachable!("handled above")
+            }
         }
         match read_optional_bytes(&state_path) {
             Ok(current) if current == original_state => {}
@@ -504,12 +522,22 @@ fn planned_action(destination: &Path, state_path: &Path) -> Result<AgentSkillIns
 
     let current = fs::read(destination)
         .with_context(|| format!("read agent-sync skill {}", destination.display()))?;
+    let state = load_state(state_path)?;
+    if let Some(state) = &state {
+        validate_state_identity(state, destination, state_path)?;
+    }
+    if state.is_none_or(|state| state.installed_sha256 != sha256(&current)) {
+        let content = std::str::from_utf8(&current)
+            .with_context(|| format!("agent-sync skill {} is not UTF-8", destination.display()))?;
+        if content.trim().is_empty() {
+            bail!("agent-sync skill {} is empty", destination.display());
+        }
+        return Ok(AgentSkillInstallAction::Preserved);
+    }
     if current == BUNDLED_AGENT_SKILL.as_bytes() {
-        require_unmodified_managed_copy(destination, state_path)?;
         return Ok(AgentSkillInstallAction::Unchanged);
     }
 
-    require_unmodified_managed_copy(destination, state_path)?;
     Ok(AgentSkillInstallAction::Update)
 }
 
@@ -553,6 +581,14 @@ fn validate_state_identity(
             destination.display(),
             state.destination.display()
         );
+    }
+    if state.installed_sha256.len() != 64
+        || !state
+            .installed_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("invalid bundled skill hash in {}", state_path.display());
     }
     Ok(())
 }
@@ -642,6 +678,73 @@ fn sha256(content: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_rollback_leaves_a_preserved_skill_and_its_state_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        install_agent_skill(&paths, AgentSkillInstallOptions { dry_run: false }).unwrap();
+        let destination = skill_destination(&paths);
+        let state_path = skill_state_path(&paths);
+        let state = fs::read(&state_path).unwrap();
+        let custom = b"# My custom sync instructions\n";
+        fs::write(&destination, custom).unwrap();
+        let mut attempt = 0;
+
+        let error = install_agent_skills_with(
+            &paths,
+            AgentSkillInstallOptions { dry_run: false },
+            |paths, destination, state_path, options| {
+                attempt += 1;
+                if attempt == 2 {
+                    bail!("injected second destination failure");
+                }
+                install_agent_skill_at(paths, destination, state_path, options)
+            },
+        )
+        .unwrap_err();
+
+        assert!(!error.to_string().contains("rollback also failed"));
+        assert_eq!(fs::read(destination).unwrap(), custom);
+        assert_eq!(fs::read(state_path).unwrap(), state);
+        assert!(!claude_skill_destination(&paths).exists());
+    }
+
+    #[test]
+    fn preservation_does_not_hide_invalid_skill_or_ownership_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::for_test(temp.path());
+        install_agent_skill(&paths, AgentSkillInstallOptions { dry_run: false }).unwrap();
+        let destination = skill_destination(&paths);
+        let state_path = skill_state_path(&paths);
+        let original_state = fs::read(&state_path).unwrap();
+
+        for invalid_skill in [b" \n".as_slice(), &[0xff]] {
+            fs::write(&destination, invalid_skill).unwrap();
+            assert!(
+                install_agent_skills(&paths, AgentSkillInstallOptions { dry_run: false }).is_err()
+            );
+            assert!(!claude_skill_destination(&paths).exists());
+            assert_eq!(fs::read(&state_path).unwrap(), original_state);
+        }
+
+        fs::write(&destination, b"# My custom instructions\n").unwrap();
+        fs::write(&state_path, b"not json").unwrap();
+        let error =
+            install_agent_skills(&paths, AgentSkillInstallOptions { dry_run: false }).unwrap_err();
+        assert!(error.to_string().contains("parse bundled skill state"));
+        assert!(!claude_skill_destination(&paths).exists());
+
+        let mut state: BundledSkillState = serde_json::from_slice(&original_state).unwrap();
+        state.destination = paths.home.join("other-skill");
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let error =
+            install_agent_skills(&paths, AgentSkillInstallOptions { dry_run: false }).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refusing to use bundled skill state"));
+        assert!(!claude_skill_destination(&paths).exists());
+    }
 
     #[test]
     fn aggregate_install_rolls_back_an_earlier_destination() {

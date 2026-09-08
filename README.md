@@ -110,6 +110,8 @@ does not require memorized command lines.
   update those resources only while their installed content remains unchanged.
   Pre-existing matching resources are not silently adopted, and manual edits
   return the resource to Claude Code ownership.
+- An edited, nonempty control skill is preserved and reported as a warning.
+  It does not prevent other skills or MCP entries from syncing.
 - Selected MCP definitions keep environment-variable references. Raw bearer
   tokens, API keys, passwords, and private keys are rejected.
 - Managed replacements create backups. Changed or unowned schedule files are
@@ -201,6 +203,17 @@ The job uses the installed binary's absolute path and runs `sync --yes
 --automation` every 24 hours. It pins the effective agent and config paths from
 setup, so custom locations keep working in the background. Logs are stored
 under `~/.agent-sync/logs`.
+
+On macOS, a failed scheduled sync requests a local notification with a generic
+message. Notification delivery depends on macOS notification settings. Error
+details, file contents, and credentials are never included in the notification.
+Successful runs with no changes stay quiet. Ask your agent to check sync health
+if a daily run is missed or a notification appears.
+
+When optional QMD refresh fails, completed and verified agent updates remain
+applied. The run still reports failure and does not advance its last-success
+record. QMD may refresh other collections in its index, so their permissions
+also need to work in the background.
 
 Preview removal before applying it:
 
@@ -390,6 +403,20 @@ share a personal pack by default.
 The same binary and bundled skill work with each supported local agent. Plugin
 installations and account connections remain native to each agent;
 `agent-sync` does not try to copy their credentials or sessions.
+
+Switching which agent you work in does not change the configured source. This
+is a one-source sync, not a two-way merge. For skills you want to use from any
+agent, keep one maintained copy under `~/.agents/skills/<name>/SKILL.md` and
+avoid different copies with the same name. Shared skills are included with the
+selected source and copied to targets where needed. You can ask your agent:
+"Create this as a shared skill, then preview and sync my agents."
+
+Skills installed only in a target agent do not automatically flow back into
+the source. Custom subagent definitions, plugin runtimes, authentication, and
+application-specific settings are not synchronized. Install each required
+plugin and connect its account in the agent where you use it. Sharing this
+repository or installer does not share your own skills or configuration with
+teammates; distribute reviewed team skills separately.
 
 For a predictable rollout, pin `AGENT_SYNC_VERSION` in your internal setup
 guide and test upgrades on one machine before changing the team pin. The public

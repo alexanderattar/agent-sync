@@ -3,6 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod notifications;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -582,7 +584,7 @@ fn background_status_line(background: &BackgroundStatus) -> StatusLine {
     match (background.supported, background.enabled, background.healthy) {
         (true, true, Some(true)) => StatusLine {
             label: "Background".to_string(),
-            value: "daily sync is running".to_string(),
+            value: "daily job is loaded".to_string(),
             tone: Tone::Healthy,
         },
         (true, false, Some(false)) if background.action.as_deref() == Some("add") => StatusLine {
@@ -1279,8 +1281,16 @@ fn apply_cursor_history_options(config: &mut Config, args: &SetupArgs) {
 }
 
 fn run_sync(context: &AppContext, args: SyncArgs) -> Result<()> {
+    run_sync_with_notifier(context, args, notifications::scheduled_sync_failure)
+}
+
+fn run_sync_with_notifier(
+    context: &AppContext,
+    args: SyncArgs,
+    notify_failure: impl FnOnce(),
+) -> Result<()> {
     let executable = std::env::current_exe()?;
-    let report = sync_managed(
+    let result = sync_managed(
         &context.paths,
         &context.config_path,
         &executable,
@@ -1288,7 +1298,11 @@ fn run_sync(context: &AppContext, args: SyncArgs) -> Result<()> {
             dry_run: !args.yes,
             automation: args.automation,
         },
-    )?;
+    );
+    if args.yes && args.automation && result.is_err() {
+        notify_failure();
+    }
+    let report = result?;
     print!("{}", report.to_text());
     Ok(())
 }
@@ -1643,6 +1657,42 @@ fn parse_names(raw: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_failed_scheduled_syncs_request_a_notification() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = AppContext {
+            paths: AgentPaths::for_test(temp.path()),
+            config_path: temp.path().join(".agent-sync/config.toml"),
+        };
+        // Missing configuration must still alert even before a run record exists.
+        for (yes, automation) in [(false, false), (true, false), (true, true)] {
+            let mut notified = false;
+            let result = run_sync_with_notifier(&context, SyncArgs { yes, automation }, || {
+                notified = true;
+            });
+            assert!(result.is_err());
+            assert_eq!(notified, yes && automation);
+        }
+
+        std::fs::create_dir_all(&context.paths.codex_home).unwrap();
+        setup_managed(
+            &context.paths,
+            &context.config_path,
+            &Config::default(),
+            SetupOptions { dry_run: false },
+        )
+        .unwrap();
+        run_sync_with_notifier(
+            &context,
+            SyncArgs {
+                yes: true,
+                automation: true,
+            },
+            || panic!("a successful sync must not notify"),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn setup_sources_include_only_agent_directories_found_on_disk() {
