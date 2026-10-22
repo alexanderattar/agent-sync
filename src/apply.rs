@@ -18,13 +18,13 @@ use crate::{
     },
     manifest::{Manifest, Resource, ResourceKind},
     mcp::{
-        claude_mcp_server, claude_mcp_value, cursor_mcp_server, cursor_mcp_value,
-        discover_cursor_project_mcp_names, ensure_cursor_mcp_write_safe, load_pack_mcp,
-        read_claude_mcp_snapshot, read_cursor_mcp_snapshot,
-        render_claude_mcp_additive_with_updates, render_cursor_mcp_additive_with_updates,
-        write_codex_mcp, McpServer,
+        amp_mcp_server, amp_mcp_value, claude_mcp_server, claude_mcp_value, cursor_mcp_server,
+        cursor_mcp_value, discover_cursor_project_mcp_names, ensure_cursor_mcp_write_safe,
+        load_pack_mcp, read_amp_mcp_snapshot, read_claude_mcp_snapshot, read_cursor_mcp_snapshot,
+        render_amp_mcp_additive_with_updates, render_claude_mcp_additive_with_updates,
+        render_cursor_mcp_additive_with_updates, write_codex_mcp, McpServer,
     },
-    ownership::ClaudeResourceOwnership,
+    ownership::ResourceOwnership,
 };
 
 const MCP_STATE_SCHEMA_VERSION: u32 = 1;
@@ -139,22 +139,14 @@ pub(crate) fn diff_pack_with_policy(
 ) -> Result<Vec<Change>> {
     let manifest = Manifest::load(pack)?;
     let mcp = load_pack_mcp(pack)?;
-    let claude_ownership = if manifest.resources.iter().any(|resource| {
-        matches!(resource.kind, ResourceKind::Skill | ResourceKind::Rule)
-            && resource.targets.contains(&AgentKind::Claude)
-            && targets.contains(&AgentKind::Claude)
-    }) {
-        Some(ClaudeResourceOwnership::load(paths)?)
-    } else {
-        None
-    };
+    let ownership = load_resource_ownership(paths, &manifest, targets)?;
     let mut changes = Vec::new();
     for resource in &manifest.resources {
         for target in targets {
             if !resource.targets.contains(target) {
                 continue;
             }
-            let Some(destination) = destination_for(paths, resource, *target) else {
+            let Some(destination) = destination_for(paths, resource, *target)? else {
                 continue;
             };
             let action = match resource.kind {
@@ -166,7 +158,7 @@ pub(crate) fn diff_pack_with_policy(
                     resource,
                     *target,
                     &destination,
-                    claude_ownership.as_ref(),
+                    ownership.get(target),
                     allow_updates,
                 )?,
                 _ => file_change_action(
@@ -174,7 +166,7 @@ pub(crate) fn diff_pack_with_policy(
                     resource,
                     *target,
                     &destination,
-                    claude_ownership.as_ref(),
+                    ownership.get(target),
                     allow_updates,
                 )?,
             };
@@ -229,16 +221,8 @@ pub fn apply_pack(
 
     let manifest = Manifest::load(pack)?;
     let mcp = load_pack_mcp(pack)?;
-    let mut claude_ownership = if manifest.resources.iter().any(|resource| {
-        matches!(resource.kind, ResourceKind::Skill | ResourceKind::Rule)
-            && resource.targets.contains(&AgentKind::Claude)
-            && targets.contains(&AgentKind::Claude)
-    }) {
-        Some(ClaudeResourceOwnership::load(paths)?)
-    } else {
-        None
-    };
-    let mut claude_ownership_changed = false;
+    let mut ownership = load_resource_ownership(paths, &manifest, targets)?;
+    let mut ownership_changed = BTreeSet::new();
     let mut applied_mcp_targets = BTreeSet::new();
     let mut applied_writes = Vec::new();
     let apply_result = (|| -> Result<()> {
@@ -248,7 +232,7 @@ pub fn apply_pack(
                     continue;
                 }
                 let action = if resource.kind != ResourceKind::Mcp {
-                    let Some(destination) = destination_for(paths, resource, *target) else {
+                    let Some(destination) = destination_for(paths, resource, *target)? else {
                         continue;
                     };
                     let action = match resource.kind {
@@ -257,7 +241,7 @@ pub fn apply_pack(
                             resource,
                             *target,
                             &destination,
-                            claude_ownership.as_ref(),
+                            ownership.get(target),
                             options.allow_updates,
                         )?,
                         ResourceKind::Skill
@@ -267,7 +251,7 @@ pub fn apply_pack(
                             resource,
                             *target,
                             &destination,
-                            claude_ownership.as_ref(),
+                            ownership.get(target),
                             options.allow_updates,
                         )?,
                         ResourceKind::Mcp => unreachable!(),
@@ -297,7 +281,7 @@ pub fn apply_pack(
                     ResourceKind::Skill
                     | ResourceKind::MemoryReference
                     | ResourceKind::AutomationTemplate => {
-                        let Some(destination) = destination_for(paths, resource, *target) else {
+                        let Some(destination) = destination_for(paths, resource, *target)? else {
                             continue;
                         };
                         let source = pack.join(&resource.pack_path);
@@ -310,7 +294,7 @@ pub fn apply_pack(
                             resource,
                             *target,
                             &destination,
-                            claude_ownership.as_ref(),
+                            ownership.get(target),
                             options.allow_updates,
                         )?;
                         update_action_and_destination(
@@ -350,17 +334,16 @@ pub fn apply_pack(
                             backup: backup.clone(),
                             installed_sha256: Some(installed_sha256.clone()),
                         });
-                        if *target == AgentKind::Claude && resource.kind == ResourceKind::Skill {
-                            claude_ownership
-                                .as_mut()
-                                .context("Claude resource ownership state was not loaded")?
-                                .record(resource, destination.clone(), installed_sha256)?;
-                            claude_ownership_changed = true;
+                        if resource.kind == ResourceKind::Skill {
+                            if let Some(owner) = ownership.get_mut(target) {
+                                owner.record(resource, destination.clone(), installed_sha256)?;
+                                ownership_changed.insert(*target);
+                            }
                         }
                         update_backup(&mut changes, *target, resource, backup);
                     }
                     ResourceKind::Rule => {
-                        let Some(destination) = destination_for(paths, resource, *target) else {
+                        let Some(destination) = destination_for(paths, resource, *target)? else {
                             continue;
                         };
                         let content = rendered_rule(pack, resource, *target)?;
@@ -375,7 +358,7 @@ pub fn apply_pack(
                             resource,
                             *target,
                             &destination,
-                            claude_ownership.as_ref(),
+                            ownership.get(target),
                             options.allow_updates,
                         )?;
                         update_action_and_destination(
@@ -415,12 +398,9 @@ pub fn apply_pack(
                             backup: backup.clone(),
                             installed_sha256: Some(installed_sha256.clone()),
                         });
-                        if *target == AgentKind::Claude {
-                            claude_ownership
-                                .as_mut()
-                                .context("Claude resource ownership state was not loaded")?
-                                .record(resource, destination.clone(), installed_sha256)?;
-                            claude_ownership_changed = true;
+                        if let Some(owner) = ownership.get_mut(target) {
+                            owner.record(resource, destination.clone(), installed_sha256)?;
+                            ownership_changed.insert(*target);
                         }
                         update_backup(&mut changes, *target, resource, backup);
                     }
@@ -468,21 +448,21 @@ pub fn apply_pack(
                 }
             }
         }
-        if claude_ownership_changed {
-            let ownership = claude_ownership
-                .as_ref()
-                .context("Claude resource ownership state was not loaded")?;
-            let content = ownership.render()?;
+        for target in ownership_changed {
+            let owner = ownership
+                .get(&target)
+                .context("resource ownership state was not loaded")?;
+            let content = owner.render()?;
             let backup = replace_file_with_backup_if_unchanged(
                 &backup_root,
                 &paths.home,
-                ownership.path(),
-                ownership.raw(),
+                owner.path(),
+                owner.raw(),
                 &content,
             )
-            .context("write Claude resource ownership state")?;
+            .context("write resource ownership state")?;
             applied_writes.push(AppliedWrite {
-                destination: ownership.path().to_path_buf(),
+                destination: owner.path().to_path_buf(),
                 backup,
                 installed_sha256: Some(hash_bytes(&content)),
             });
@@ -584,18 +564,48 @@ pub fn format_diff(changes: &[Change]) -> String {
     out
 }
 
-fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -> Option<PathBuf> {
-    match (resource.kind, target) {
+fn load_resource_ownership(
+    paths: &AgentPaths,
+    manifest: &Manifest,
+    targets: &[AgentKind],
+) -> Result<BTreeMap<AgentKind, ResourceOwnership>> {
+    targets
+        .iter()
+        .copied()
+        .filter(|target| *target != AgentKind::Cursor)
+        .filter(|target| {
+            manifest.resources.iter().any(|resource| {
+                matches!(resource.kind, ResourceKind::Skill | ResourceKind::Rule)
+                    && resource.targets.contains(target)
+            })
+        })
+        .map(|target| Ok((target, ResourceOwnership::load_for(paths, target)?)))
+        .collect()
+}
+
+fn destination_for(
+    paths: &AgentPaths,
+    resource: &Resource,
+    target: AgentKind,
+) -> Result<Option<PathBuf>> {
+    Ok(match (resource.kind, target) {
         (ResourceKind::Skill, AgentKind::Codex) => {
             Some(paths.codex_home.join("skills").join(&resource.name))
         }
         (ResourceKind::Skill, AgentKind::Claude) => {
             Some(paths.claude_home.join("skills").join(&resource.name))
         }
+        (ResourceKind::Skill, AgentKind::Amp) => Some(
+            crate::discover::discover_amp_skills(paths)?
+                .into_iter()
+                .find(|skill| skill.name == resource.name)
+                .map(|skill| skill.path)
+                .unwrap_or_else(|| paths.amp_home.join("skills").join(&resource.name)),
+        ),
         (ResourceKind::Skill, AgentKind::Cursor) => {
             let cursor_owned = paths.cursor_home.join("skills").join(&resource.name);
             if cursor_owned.exists() {
-                return Some(cursor_owned);
+                return Ok(Some(cursor_owned));
             }
             let shared = match resource.source_agent.as_str() {
                 "codex" => paths.codex_home.join("skills").join(&resource.name),
@@ -641,6 +651,30 @@ fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -
         (ResourceKind::Mcp, AgentKind::Codex) => Some(paths.codex_home.join("config.toml")),
         (ResourceKind::Mcp, AgentKind::Claude) => Some(paths.claude_config.clone()),
         (ResourceKind::Mcp, AgentKind::Cursor) => Some(paths.cursor_config.clone()),
+        (ResourceKind::Mcp, AgentKind::Amp) => Some(paths.amp_config.clone()),
+        (ResourceKind::Rule, AgentKind::Amp)
+            if matches!(
+                resource.name.as_str(),
+                "codex-agents" | "amp-agents" | "claude-user"
+            ) =>
+        {
+            Some(paths.amp_home.join("AGENTS.md"))
+        }
+        (ResourceKind::Rule, AgentKind::Claude) if resource.source_agent == "amp" => Some(
+            paths
+                .claude_home
+                .join("rules")
+                .join(format!("imported-{}.md", resource.name)),
+        ),
+        (ResourceKind::Rule, AgentKind::Codex) if resource.source_agent == "amp" => {
+            Some(paths.codex_home.join("AGENTS.md"))
+        }
+        (ResourceKind::Rule, AgentKind::Cursor) if resource.source_agent == "amp" => Some(
+            paths
+                .cursor_home
+                .join("rules")
+                .join(format!("imported-{}.mdc", resource.name)),
+        ),
         (ResourceKind::MemoryReference, AgentKind::Claude) => Some(
             paths
                 .claude_home
@@ -648,7 +682,7 @@ fn destination_for(paths: &AgentPaths, resource: &Resource, target: AgentKind) -
                 .join(&resource.name),
         ),
         _ => None,
-    }
+    })
 }
 
 fn file_change_action(
@@ -656,7 +690,7 @@ fn file_change_action(
     resource: &Resource,
     target: AgentKind,
     destination: &Path,
-    claude_ownership: Option<&ClaudeResourceOwnership>,
+    ownership: Option<&ResourceOwnership>,
     allow_updates: bool,
 ) -> Result<ChangeAction> {
     let source = pack.join(&resource.pack_path);
@@ -664,7 +698,10 @@ fn file_change_action(
     if metadata
         .as_ref()
         .is_some_and(|metadata| metadata.file_type().is_symlink())
-        && matches!(target, AgentKind::Claude | AgentKind::Cursor)
+        && matches!(
+            target,
+            AgentKind::Claude | AgentKind::Cursor | AgentKind::Amp
+        )
     {
         Ok(ChangeAction::Skip)
     } else if metadata.is_none() {
@@ -673,8 +710,15 @@ fn file_change_action(
         Ok(ChangeAction::Unchanged)
     } else if target == AgentKind::Cursor {
         Ok(ChangeAction::Skip)
-    } else if target == AgentKind::Claude && resource.kind == ResourceKind::Skill {
-        claude_replacement_action(resource, destination, claude_ownership, allow_updates)
+    } else if matches!(target, AgentKind::Claude | AgentKind::Amp)
+        && resource.kind == ResourceKind::Skill
+    {
+        managed_replacement_action(
+            resource,
+            destination,
+            ownership,
+            allow_updates && target == AgentKind::Claude,
+        )
     } else {
         Ok(ChangeAction::Update)
     }
@@ -685,7 +729,7 @@ fn rule_change_action(
     resource: &Resource,
     target: AgentKind,
     destination: &Path,
-    claude_ownership: Option<&ClaudeResourceOwnership>,
+    ownership: Option<&ResourceOwnership>,
     allow_updates: bool,
 ) -> Result<ChangeAction> {
     let content = rendered_rule(pack, resource, target)?;
@@ -693,7 +737,10 @@ fn rule_change_action(
     if metadata
         .as_ref()
         .is_some_and(|metadata| metadata.file_type().is_symlink())
-        && matches!(target, AgentKind::Claude | AgentKind::Cursor)
+        && matches!(
+            target,
+            AgentKind::Claude | AgentKind::Cursor | AgentKind::Amp
+        )
     {
         Ok(ChangeAction::Skip)
     } else if metadata.is_none() {
@@ -706,20 +753,26 @@ fn rule_change_action(
             resource,
             existing.as_deref(),
         ))
-    } else if target == AgentKind::Claude {
-        claude_replacement_action(resource, destination, claude_ownership, allow_updates)
+    } else if matches!(target, AgentKind::Claude | AgentKind::Amp) || resource.source_agent == "amp"
+    {
+        managed_replacement_action(
+            resource,
+            destination,
+            ownership,
+            allow_updates && target == AgentKind::Claude,
+        )
     } else {
         Ok(ChangeAction::Update)
     }
 }
 
-fn claude_replacement_action(
+fn managed_replacement_action(
     resource: &Resource,
     destination: &Path,
-    ownership: Option<&ClaudeResourceOwnership>,
+    ownership: Option<&ResourceOwnership>,
     allow_updates: bool,
 ) -> Result<ChangeAction> {
-    let ownership = ownership.context("Claude resource ownership state was not loaded")?;
+    let ownership = ownership.context("resource ownership state was not loaded")?;
     let current_sha256 = hash_path(destination)?;
     if ownership.is_unmodified(resource, destination, &current_sha256)? {
         Ok(ChangeAction::ManagedUpdate)
@@ -731,11 +784,20 @@ fn claude_replacement_action(
 }
 
 fn cursor_rule_replacement_action(resource: &Resource, existing: Option<&str>) -> ChangeAction {
-    if resource.name == "codex-agents"
-        && existing.is_some_and(|content| {
+    let managed = match resource.name.as_str() {
+        "codex-agents" => existing.is_some_and(|content| {
             content == LEGACY_CURSOR_CODEX_RULE || managed_cursor_rule_is_unmodified(content)
-        })
-    {
+        }),
+        "amp-agents" => existing.is_some_and(|content| {
+            cursor_rule_is_unmodified(
+                content,
+                CURSOR_AMP_RULE_FRONTMATTER,
+                CURSOR_AMP_RULE_MARKER_PREFIX,
+            )
+        }),
+        _ => false,
+    };
+    if managed {
         ChangeAction::ManagedUpdate
     } else {
         ChangeAction::Skip
@@ -754,6 +816,24 @@ fn mcp_change_action(
     };
     let existing = match target {
         AgentKind::Codex => crate::mcp::discover_codex_mcp(&paths.codex_home.join("config.toml"))?,
+        AgentKind::Amp => {
+            let desired = amp_mcp_value(server)?;
+            let (_, configured) = read_amp_mcp_snapshot(&paths.amp_config)?;
+            if let Some(existing) = configured.get(name) {
+                if amp_mcp_server(existing) == amp_mcp_server(&desired) {
+                    return Ok(ChangeAction::Unchanged);
+                }
+                let state = load_mcp_state(paths, AgentKind::Amp)?;
+                return Ok(
+                    if state.state.servers.get(name) == Some(&mcp_value_sha256(existing)?) {
+                        ChangeAction::ManagedUpdate
+                    } else {
+                        ChangeAction::Skip
+                    },
+                );
+            }
+            return Ok(ChangeAction::Add);
+        }
         AgentKind::Claude => {
             let (_, configured) = read_claude_mcp_snapshot(&paths.claude_config)?;
             if let Some(existing) = configured.get(name) {
@@ -814,6 +894,10 @@ const CURSOR_CODEX_RULE_FRONTMATTER: &str =
 const CURSOR_CODEX_RULE_MARKER_PREFIX: &str =
     "<!-- agent-sync-managed: cursor-codex-agents body-sha256=";
 const CURSOR_CODEX_RULE_MARKER_SUFFIX: &str = " -->";
+const CURSOR_AMP_RULE_FRONTMATTER: &str =
+    "---\ndescription: Imported Amp agent guidance\nalwaysApply: true\n---\n";
+const CURSOR_AMP_RULE_MARKER_PREFIX: &str =
+    "<!-- agent-sync-managed: cursor-amp-agents body-sha256=";
 const LEGACY_CURSOR_CODEX_RULE: &str = "---\ndescription: Bridge to Codex global agent rules\nalwaysApply: true\n---\n# Codex Agent Rule Bridge\n\nBefore starting a task, read and follow `~/.codex/AGENTS.md` when it exists. Treat it as shared guidance. Direct user instructions and Cursor-specific settings and rules take precedence if they conflict with that file.\n\nWhen prior work may matter, search the QMD `sessions` collection. QMD history is searchable context, not a resumable Cursor chat.\n";
 
 fn rendered_rule(pack: &Path, resource: &Resource, target: AgentKind) -> Result<String> {
@@ -824,6 +908,11 @@ fn rendered_rule(pack: &Path, resource: &Resource, target: AgentKind) -> Result<
             raw
         )),
         ("codex-agents", AgentKind::Cursor) => Ok(render_cursor_codex_rule(&raw)),
+        ("amp-agents", AgentKind::Cursor) => {
+            let body = format!("# Imported Amp Agent Rules\n\nCursor-specific settings and rules take precedence if they conflict.\n\n{raw}");
+            let hash = hash_bytes(body.as_bytes());
+            Ok(format!("{CURSOR_AMP_RULE_FRONTMATTER}{CURSOR_AMP_RULE_MARKER_PREFIX}{hash}{CURSOR_CODEX_RULE_MARKER_SUFFIX}\n{body}"))
+        }
         _ => Ok(raw),
     }
 }
@@ -839,21 +928,29 @@ fn render_cursor_codex_rule(raw: &str) -> String {
 }
 
 fn managed_cursor_rule_is_unmodified(content: &str) -> bool {
-    let Some(marked_body) = content.strip_prefix(CURSOR_CODEX_RULE_FRONTMATTER) else {
+    cursor_rule_is_unmodified(
+        content,
+        CURSOR_CODEX_RULE_FRONTMATTER,
+        CURSOR_CODEX_RULE_MARKER_PREFIX,
+    )
+}
+
+fn cursor_rule_is_unmodified(content: &str, frontmatter: &str, prefix: &str) -> bool {
+    let Some(marked_body) = content.strip_prefix(frontmatter) else {
         return false;
     };
     let Some((marker, body)) = marked_body.split_once('\n') else {
         return false;
     };
-    let Some(expected_sha256) = cursor_rule_marker_hash(marker) else {
+    let Some(expected_sha256) = cursor_rule_marker_hash(marker, prefix) else {
         return false;
     };
     hash_bytes(body.as_bytes()) == expected_sha256
 }
 
-fn cursor_rule_marker_hash(marker: &str) -> Option<&str> {
+fn cursor_rule_marker_hash<'a>(marker: &'a str, prefix: &str) -> Option<&'a str> {
     let hash = marker
-        .strip_prefix(CURSOR_CODEX_RULE_MARKER_PREFIX)?
+        .strip_prefix(prefix)?
         .strip_suffix(CURSOR_CODEX_RULE_MARKER_SUFFIX)?;
     (hash.len() == 64
         && hash
@@ -870,7 +967,9 @@ fn apply_mcp(
     changes: &[Change],
 ) -> Result<McpApplyResult> {
     match target {
-        AgentKind::Claude => apply_claude_mcp(paths, backup_root, mcp, changes),
+        AgentKind::Claude | AgentKind::Amp => {
+            apply_json_mcp(paths, backup_root, mcp, target, changes)
+        }
         AgentKind::Codex => {
             let path = paths.codex_home.join("config.toml");
             let expected = read_bytes_if_exists(&path)?;
@@ -899,18 +998,24 @@ fn apply_mcp(
     }
 }
 
-fn apply_claude_mcp(
+fn apply_json_mcp(
     paths: &AgentPaths,
     backup_root: &Path,
     mcp: &BTreeMap<String, McpServer>,
+    target: AgentKind,
     changes: &[Change],
 ) -> Result<McpApplyResult> {
-    let mut state_snapshot = load_mcp_state(paths, AgentKind::Claude)?;
-    let (expected_config, configured) = read_claude_mcp_snapshot(&paths.claude_config)?;
+    let mut state_snapshot = load_mcp_state(paths, target)?;
+    let config_path = mcp_destination(paths, target);
+    let (expected_config, configured) = if target == AgentKind::Amp {
+        read_amp_mcp_snapshot(&config_path)?
+    } else {
+        read_claude_mcp_snapshot(&config_path)?
+    };
     let mut servers = BTreeMap::new();
     let mut replacements = BTreeSet::new();
 
-    for (name, action) in mcp_actions(changes, AgentKind::Claude) {
+    for (name, action) in mcp_actions(changes, target) {
         let server = mcp
             .get(&name)
             .with_context(|| format!("manifest MCP `{name}` is missing from mcp/servers.json"))?;
@@ -933,7 +1038,12 @@ fn apply_claude_mcp(
         if matches!(action, ChangeAction::Update | ChangeAction::ManagedUpdate) {
             replacements.insert(name.clone());
         }
-        let installed_sha256 = mcp_value_sha256(&claude_mcp_value(server)?)?;
+        let value = if target == AgentKind::Amp {
+            amp_mcp_value(server)?
+        } else {
+            claude_mcp_value(server)?
+        };
+        let installed_sha256 = mcp_value_sha256(&value)?;
         state_snapshot
             .state
             .servers
@@ -945,8 +1055,13 @@ fn apply_claude_mcp(
         return Ok(McpApplyResult::default());
     }
 
-    let content = render_claude_mcp_additive_with_updates(
-        &paths.claude_config,
+    let render = if target == AgentKind::Amp {
+        render_amp_mcp_additive_with_updates
+    } else {
+        render_claude_mcp_additive_with_updates
+    };
+    let content = render(
+        &config_path,
         expected_config.as_deref(),
         &servers,
         &replacements,
@@ -957,12 +1072,12 @@ fn apply_claude_mcp(
     let config_backup = replace_file_with_backup_if_unchanged(
         backup_root,
         &paths.home,
-        &paths.claude_config,
+        &config_path,
         expected_config.as_deref(),
         &content,
     )?;
     let config_write = AppliedWrite {
-        destination: paths.claude_config.clone(),
+        destination: config_path,
         backup: config_backup,
         installed_sha256: Some(hash_bytes(&content)),
     };
@@ -1073,6 +1188,7 @@ fn mcp_state_path(paths: &AgentPaths, target: AgentKind) -> Result<PathBuf> {
     let file = match target {
         AgentKind::Claude => "claude-mcp.json",
         AgentKind::Cursor => "cursor-mcp.json",
+        AgentKind::Amp => "amp-mcp.json",
         AgentKind::Codex => bail!("Codex MCP ownership is not tracked in a JSON state file"),
     };
     Ok(paths.home.join(".agent-sync").join("state").join(file))
@@ -1206,6 +1322,7 @@ fn mcp_agent_name(target: AgentKind) -> &'static str {
         AgentKind::Claude => "Claude",
         AgentKind::Cursor => "Cursor",
         AgentKind::Codex => "Codex",
+        AgentKind::Amp => "Amp",
     }
 }
 
@@ -1229,6 +1346,7 @@ fn mcp_destination(paths: &AgentPaths, target: AgentKind) -> PathBuf {
         AgentKind::Claude => paths.claude_config.clone(),
         AgentKind::Codex => paths.codex_home.join("config.toml"),
         AgentKind::Cursor => paths.cursor_config.clone(),
+        AgentKind::Amp => paths.amp_config.clone(),
     }
 }
 
@@ -1311,6 +1429,7 @@ fn agent_root(paths: &AgentPaths, target: AgentKind) -> &Path {
         AgentKind::Codex => &paths.codex_home,
         AgentKind::Claude => &paths.claude_home,
         AgentKind::Cursor => &paths.cursor_home,
+        AgentKind::Amp => &paths.amp_home,
     }
 }
 

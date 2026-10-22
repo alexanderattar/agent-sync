@@ -1,7 +1,7 @@
 # agent-sync
 
 `agent-sync` keeps local agent configuration aligned across Codex, Claude Code,
-and Cursor. Choose one canonical setup, preview the route, and let the managed
+Cursor, and Amp. Choose one canonical setup, preview the route, and let the managed
 sync handle drift in the background.
 
 Target-owned configuration stays target-owned. `agent-sync` does not copy
@@ -78,7 +78,7 @@ glibc-based systems.
 ## Use Natural Language
 
 Saving setup installs the bundled control skill under `~/.agents/skills` for
-Codex and Cursor and under `~/.claude/skills` for Claude Code. All three agents
+Codex, Cursor, and Amp and under `~/.claude/skills` for Claude Code. All four agents
 can then manage the same setup through natural language.
 
 Ask your preferred agent:
@@ -102,14 +102,14 @@ does not require memorized command lines.
 - Existing target content is preserved unless you explicitly enable updates.
   A preserved conflict does not block unrelated missing resources from being
   added.
-- Existing Claude Code- and Cursor-specific skills, rules, MCP entries, project
+- Existing Claude Code-, Cursor-, and Amp-specific skills, rules, MCP entries, project
   configuration, editor settings, plugins, and sessions are not overwritten.
   The optional managed history hook is added or repaired without removing
   unrelated hooks.
-- Agent-sync records the Claude Code resources that it adds. Later syncs can
+- Agent-sync records the Claude Code and Amp resources that it adds. Later syncs can
   update those resources only while their installed content remains unchanged.
   Pre-existing matching resources are not silently adopted, and manual edits
-  return the resource to Claude Code ownership.
+  return the resource to its agent's ownership.
 - An edited, nonempty control skill is preserved and reported as a warning.
   It does not prevent other skills or MCP entries from syncing.
 - Selected MCP definitions keep environment-variable references. Raw bearer
@@ -146,6 +146,9 @@ agent-sync setup --from claude --to cursor --yes
 
 agent-sync setup --from cursor --to codex,claude
 agent-sync setup --from cursor --to codex,claude --yes
+
+agent-sync setup --from codex --to cursor,claude,amp
+agent-sync setup --from amp --to codex,claude,cursor
 ```
 
 No MCP server is selected by default. `--all-mcp` intentionally selects every
@@ -283,8 +286,9 @@ not exported by this workflow.
 
 `agent-sync` understands:
 
-- Codex, Claude Code, Cursor, and shared personal skills.
-- Codex guidance can be bridged additively into Claude Code and Cursor.
+- Codex, Claude Code, Cursor, Amp, and shared personal skills.
+- Codex guidance can be bridged into Claude Code, Cursor, and Amp. Amp guidance
+  can be imported into Codex, Claude Code, and Cursor.
 - Claude Code and Cursor-specific rules stay owned by their respective agent
   when their semantics do not map safely.
 - Selected MCP definitions from the canonical source, applied additively to
@@ -292,9 +296,37 @@ not exported by this workflow.
 - Optional Codex memory and automation references in advanced packs.
 - Optional Cursor transcript exports and QMD refresh.
 
-Codex, Claude Code, or Cursor can be the canonical source. Any other supported
+Codex, Claude Code, Cursor, or Amp can be the canonical source. Any other supported
 agent can be a target. Personal files are local to the machine; remote agents
 and teammates need their own installation or approved repository-level skills.
+
+### Amp
+
+Amp can be selected as a source or target in the TUI, `setup --from/--to`, and
+the low-level pack commands. Its default user directory is `~/.config/amp`;
+override it with `--amp-home` or set a separate `--amp-config` path when needed.
+
+Agent-sync reads Amp's documented personal skill locations in precedence order:
+`~/.config/agents/skills`, `~/.agents/skills`, `~/.config/amp/skills`, then
+`~/.claude/skills`. Missing skills are installed in `~/.config/amp/skills`.
+Existing higher-priority skills and user edits are preserved. Discovery searches
+up to five directories below each skill root and honors
+`amp.skills.disableGlobalAgentsSkills` and `amp.skills.disableClaudeCodeSkills`.
+Personal guidance
+comes from `~/.config/amp/AGENTS.md` and `~/.config/AGENTS.md`. Importing guidance
+into Amp preserves any existing personal `AGENTS.md` file that agent-sync does
+not own; review a preserved rule if you want to combine the guidance manually.
+
+Selected MCP servers use the literal `amp.mcpServers` key in Amp's
+`settings.json`. Unrelated settings and conflicting Amp-owned servers remain
+unchanged. Local commands and HTTP/SSE URLs are supported; unsupported options
+such as `includeTools` and `headersHelper` are rejected rather than discarded.
+Environment references use `${NAME}`. Credentials, cloud threads, remote skill
+repositories, plugin state, and account memories are not copied.
+
+See Amp's [skills documentation](https://ampcode.com/manual/agent-skills.md),
+[personal guidance](https://ampcode.com/docs/customize/agents-md), and
+[MCP configuration](https://ampcode.com/docs/customize/mcp).
 
 MCP exports keep supported environment-variable references instead of secret
 values. For example:
@@ -393,7 +425,7 @@ GitHub-hosted runners, the Rust toolchain, or locked dependencies.
 Publish a tagged release, then share the Quick Start command. Each teammate
 runs `agent-sync`, chooses a source and targets, reviews the first sync, and can
 enable daily maintenance on macOS. From then on, they can ask Codex, Claude
-Code, or Cursor to check health, preview drift, sync, or repair the setup.
+Code, Cursor, or Amp to check health, preview drift, sync, or repair the setup.
 
 Keep personal authentication and local choices on each machine. Put shared team
 instructions in version-controlled repository skills or rules. Use a reviewed,
@@ -568,7 +600,7 @@ cargo build --release
 ```
 
 The integration tests use temporary agent homes. They do not use the machine's
-real Codex, Claude, or Cursor directories.
+real Codex, Claude, Cursor, or Amp directories.
 
 ## Sharing Packs
 

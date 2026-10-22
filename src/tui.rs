@@ -36,6 +36,7 @@ pub enum Agent {
     Codex,
     Claude,
     Cursor,
+    Amp,
 }
 
 impl Agent {
@@ -45,6 +46,7 @@ impl Agent {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
             Self::Cursor => "Cursor",
+            Self::Amp => "Amp",
         }
     }
 }
@@ -1453,6 +1455,21 @@ mod tests {
             app.message,
             Some((Tone::Attention, "Choose at least one target agent.".into()))
         );
+    }
+
+    #[test]
+    fn amp_route_is_selectable_and_renders_in_setup() {
+        let mut screen = setup_screen();
+        screen.available_sources.push(Agent::Amp);
+        screen.target_agents.push(Agent::Amp);
+        screen.initial.source = Agent::Amp;
+        screen.initial.targets = vec![Agent::Codex];
+        let mut app = SetupApp::new(screen.clone());
+        assert_eq!(app.source, Some(Agent::Amp));
+        app.stage = SetupStage::Targets;
+        assert!(!app.targets.contains(&Agent::Amp));
+        let text = render_text(App::new(TuiRequest::Setup(screen)), 90, 24);
+        assert!(text.contains("Amp → Codex"));
     }
 
     #[test]

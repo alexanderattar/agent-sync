@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    adapters::AgentPaths,
+    adapters::{AgentKind, AgentPaths},
+    config::{CanonicalSource, Config},
     fsx::{
         ensure_dir, remove_target_if_unchanged, replace_file_if_unchanged,
         replace_file_with_backup_if_unchanged, restore_backup_atomically_if_unchanged,
@@ -139,10 +140,21 @@ pub fn install_agent_skills(
     paths: &AgentPaths,
     options: AgentSkillInstallOptions,
 ) -> Result<AgentSkillInstallSetReport> {
-    install_agent_skills_with(paths, options, install_agent_skill_at)
+    install_agent_skills_with(false, paths, options, install_agent_skill_at)
+}
+
+pub(crate) fn install_route_agent_skills(
+    paths: &AgentPaths,
+    config: &Config,
+    options: AgentSkillInstallOptions,
+) -> Result<AgentSkillInstallSetReport> {
+    let include_amp =
+        config.source == CanonicalSource::Amp || config.targets.contains(&AgentKind::Amp);
+    install_agent_skills_with(include_amp, paths, options, install_agent_skill_at)
 }
 
 fn install_agent_skills_with<F>(
+    include_amp: bool,
     paths: &AgentPaths,
     options: AgentSkillInstallOptions,
     mut installer: F,
@@ -155,13 +167,19 @@ where
         AgentSkillInstallOptions,
     ) -> Result<AgentSkillInstallReport>,
 {
-    let destinations = [
+    let mut destinations = vec![
         (skill_destination(paths), skill_state_path(paths)),
         (
             claude_skill_destination(paths),
             claude_skill_state_path(paths),
         ),
     ];
+    if include_amp {
+        destinations.push((
+            paths.amp_home.join("skills/agent-sync/SKILL.md"),
+            paths.home.join(".agent-sync/state/agent-skill-amp.json"),
+        ));
+    }
     let previews = destinations
         .iter()
         .map(|(destination, state_path)| {
@@ -692,6 +710,7 @@ mod tests {
         let mut attempt = 0;
 
         let error = install_agent_skills_with(
+            false,
             &paths,
             AgentSkillInstallOptions { dry_run: false },
             |paths, destination, state_path, options| {
@@ -753,6 +772,7 @@ mod tests {
         let mut attempt = 0;
 
         let error = install_agent_skills_with(
+            false,
             &paths,
             AgentSkillInstallOptions { dry_run: false },
             |paths, destination, state_path, options| {

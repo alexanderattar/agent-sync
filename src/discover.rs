@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     adapters::{AgentKind, AgentPaths},
     fsx::{list_named_skill_dirs, read_to_string_if_exists},
-    mcp::{discover_claude_mcp, discover_codex_mcp, discover_cursor_effective_mcp_names},
+    mcp::{
+        discover_amp_mcp, discover_claude_mcp, discover_codex_mcp,
+        discover_cursor_effective_mcp_names,
+    },
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -15,6 +18,7 @@ pub struct Inventory {
     pub claude: AgentInventory,
     pub cursor: AgentInventory,
     pub shared_agents: AgentInventory,
+    pub amp: AgentInventory,
 }
 
 impl Inventory {
@@ -23,6 +27,7 @@ impl Inventory {
         self.codex.push_text("Codex", &mut out);
         self.claude.push_text("Claude", &mut out);
         self.cursor.push_text("Cursor", &mut out);
+        self.amp.push_text("Amp", &mut out);
         self.shared_agents.push_text("Shared .agents", &mut out);
         out
     }
@@ -70,6 +75,7 @@ pub fn discover(paths: &AgentPaths) -> Result<Inventory> {
         claude: discover_agent(paths, AgentKind::Claude, true)?,
         cursor: discover_agent(paths, AgentKind::Cursor, true)?,
         shared_agents: discover_shared_agents(paths)?,
+        amp: discover_agent(paths, AgentKind::Amp, true)?,
     })
 }
 
@@ -82,7 +88,65 @@ pub fn discover_agent(
         AgentKind::Codex => discover_codex(paths, include_mcp),
         AgentKind::Claude => discover_claude(paths, include_mcp),
         AgentKind::Cursor => discover_cursor(paths, include_mcp),
+        AgentKind::Amp => discover_amp(paths, include_mcp),
     }
+}
+
+fn discover_amp(paths: &AgentPaths, include_mcp: bool) -> Result<AgentInventory> {
+    let skills = discover_amp_skills(paths)?;
+    let rules = [
+        paths.amp_home.join("AGENTS.md"),
+        paths.home.join(".config/AGENTS.md"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .map(|path| NamedPath {
+        name: "AGENTS.md".to_string(),
+        path,
+    })
+    .collect();
+    Ok(AgentInventory {
+        home: paths.amp_home.clone(),
+        skills,
+        rules,
+        mcp_servers: if include_mcp {
+            discover_amp_mcp(&paths.amp_config)?.into_keys().collect()
+        } else {
+            Vec::new()
+        },
+        ..AgentInventory::default()
+    })
+}
+
+pub(crate) fn discover_amp_skills(paths: &AgentPaths) -> Result<Vec<NamedPath>> {
+    let mut skills = BTreeMap::new();
+    for directory in paths.amp_skill_dirs()? {
+        if !directory.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&directory)
+            .min_depth(1)
+            .max_depth(5)
+            .follow_links(false)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        {
+            let entry =
+                entry.with_context(|| format!("discover Amp skills in {}", directory.display()))?;
+            if (entry.file_type().is_dir() || entry.path().is_symlink())
+                && entry.path().join("SKILL.md").exists()
+            {
+                skills
+                    .entry(entry.file_name().to_string_lossy().to_string())
+                    .or_insert_with(|| entry.path().to_path_buf());
+            }
+        }
+    }
+    Ok(skills
+        .into_iter()
+        .map(|(name, path)| NamedPath { name, path })
+        .collect())
 }
 
 fn discover_cursor(paths: &AgentPaths, include_mcp: bool) -> Result<AgentInventory> {

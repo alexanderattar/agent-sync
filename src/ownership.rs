@@ -9,59 +9,81 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    adapters::AgentPaths,
+    adapters::{AgentKind, AgentPaths},
     manifest::{Resource, ResourceKind},
 };
 
-const CLAUDE_OWNERSHIP_STATE_SCHEMA_VERSION: u32 = 1;
+const RESOURCE_OWNERSHIP_STATE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_OWNERSHIP_STATE_FILE: &str = "claude-resources.json";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ClaudeOwnershipState {
+struct ResourceOwnershipState {
     schema_version: u32,
-    claude_root: PathBuf,
-    resources: BTreeMap<String, ClaudeOwnedResource>,
+    #[serde(alias = "claude_root")]
+    root: PathBuf,
+    resources: BTreeMap<String, OwnedResource>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ClaudeOwnedResource {
+struct OwnedResource {
     destination: PathBuf,
     installed_sha256: String,
 }
 
-/// A validated snapshot of the Claude resources that agent-sync installed.
+/// A validated snapshot of the Agent resources that agent-sync installed.
 ///
 /// Callers must record a resource only after agent-sync successfully writes it.
 /// Matching target content without a record remains target-owned.
 #[derive(Debug)]
-pub(crate) struct ClaudeResourceOwnership {
+pub(crate) struct ResourceOwnership {
     path: PathBuf,
     original: Option<Vec<u8>>,
-    state: ClaudeOwnershipState,
+    state: ResourceOwnershipState,
+    agent: AgentKind,
 }
 
-impl ClaudeResourceOwnership {
+#[cfg(test)]
+type ClaudeResourceOwnership = ResourceOwnership;
+
+impl ResourceOwnership {
+    #[cfg(test)]
     pub(crate) fn load(paths: &AgentPaths) -> Result<Self> {
-        let path = claude_ownership_state_path(paths);
+        Self::load_for(paths, AgentKind::Claude)
+    }
+
+    pub(crate) fn load_for(paths: &AgentPaths, agent: AgentKind) -> Result<Self> {
+        let (path, root) = match agent {
+            AgentKind::Claude => (claude_ownership_state_path(paths), &paths.claude_home),
+            AgentKind::Amp => (
+                paths.home.join(".agent-sync/state/amp-resources.json"),
+                &paths.amp_home,
+            ),
+            AgentKind::Codex => (
+                paths.home.join(".agent-sync/state/codex-resources.json"),
+                &paths.codex_home,
+            ),
+            AgentKind::Cursor => bail!("Cursor resources use their existing preservation policy"),
+        };
         ensure_safe_state_path(&path)?;
         let original = read_optional_bytes(&path)?;
         let state = match original.as_deref() {
             Some(raw) => serde_json::from_slice(raw).with_context(|| {
-                format!("parse Claude resource ownership state {}", path.display())
+                format!("parse Agent resource ownership state {}", path.display())
             })?,
-            None => ClaudeOwnershipState {
-                schema_version: CLAUDE_OWNERSHIP_STATE_SCHEMA_VERSION,
-                claude_root: paths.claude_home.clone(),
+            None => ResourceOwnershipState {
+                schema_version: RESOURCE_OWNERSHIP_STATE_SCHEMA_VERSION,
+                root: root.clone(),
                 resources: BTreeMap::new(),
             },
         };
-        validate_state(&state, &paths.claude_home, &path)?;
+        validate_state(&state, root, &path)?;
         Ok(Self {
             path,
             original,
             state,
+            agent,
         })
     }
 
@@ -81,7 +103,7 @@ impl ClaudeResourceOwnership {
         destination: &Path,
         current_sha256: &str,
     ) -> Result<bool> {
-        require_sha256(current_sha256, "current Claude resource")?;
+        require_sha256(current_sha256, "current Agent resource")?;
         let identity = resource_identity(resource)?;
         let Some(owned) = self.state.resources.get(&identity) else {
             return Ok(false);
@@ -92,19 +114,19 @@ impl ClaudeResourceOwnership {
         Ok(owned.installed_sha256 == current_sha256)
     }
 
-    /// Records content that agent-sync just installed at a Claude destination.
+    /// Records content that agent-sync just installed at an agent destination.
     pub(crate) fn record(
         &mut self,
         resource: &Resource,
         destination: PathBuf,
         installed_sha256: String,
     ) -> Result<()> {
-        require_sha256(&installed_sha256, "installed Claude resource")?;
-        validate_destination(&self.state.claude_root, &destination, &self.path)?;
+        require_sha256(&installed_sha256, "installed Agent resource")?;
+        validate_destination(&self.state.root, &destination, &self.path)?;
         let identity = resource_identity(resource)?;
         self.state.resources.insert(
             identity,
-            ClaudeOwnedResource {
+            OwnedResource {
                 destination,
                 installed_sha256,
             },
@@ -113,8 +135,18 @@ impl ClaudeResourceOwnership {
     }
 
     pub(crate) fn render(&self) -> Result<Vec<u8>> {
-        validate_state(&self.state, &self.state.claude_root, &self.path)?;
-        Ok([serde_json::to_vec_pretty(&self.state)?, b"\n".to_vec()].concat())
+        validate_state(&self.state, &self.state.root, &self.path)?;
+        let mut value = serde_json::to_value(&self.state)?;
+        // Keep the existing Claude state format readable by older releases.
+        if self.agent == AgentKind::Claude {
+            let object = value
+                .as_object_mut()
+                .context("resource ownership must be an object")?;
+            if let Some(root) = object.remove("root") {
+                object.insert("claude_root".to_string(), root);
+            }
+        }
+        Ok([serde_json::to_vec_pretty(&value)?, b"\n".to_vec()].concat())
     }
 }
 
@@ -126,27 +158,27 @@ pub(crate) fn claude_ownership_state_path(paths: &AgentPaths) -> PathBuf {
         .join(CLAUDE_OWNERSHIP_STATE_FILE)
 }
 
-fn validate_state(state: &ClaudeOwnershipState, claude_root: &Path, path: &Path) -> Result<()> {
-    if state.schema_version != CLAUDE_OWNERSHIP_STATE_SCHEMA_VERSION {
+fn validate_state(state: &ResourceOwnershipState, root: &Path, path: &Path) -> Result<()> {
+    if state.schema_version != RESOURCE_OWNERSHIP_STATE_SCHEMA_VERSION {
         bail!(
-            "unsupported Claude resource ownership state version {} in {}",
+            "unsupported Agent resource ownership state version {} in {}",
             state.schema_version,
             path.display()
         );
     }
-    if state.claude_root != claude_root {
+    if state.root != root {
         bail!(
-            "refusing to use Claude resource ownership state for {}; it records {}",
-            claude_root.display(),
-            state.claude_root.display()
+            "refusing to use Agent resource ownership state for {}; it records {}",
+            root.display(),
+            state.root.display()
         );
     }
     for (identity, owned) in &state.resources {
         validate_identity(identity, path)?;
-        validate_destination(claude_root, &owned.destination, path)?;
+        validate_destination(root, &owned.destination, path)?;
         require_sha256(
             &owned.installed_sha256,
-            &format!("Claude resource `{identity}`"),
+            &format!("Agent resource `{identity}`"),
         )?;
     }
     Ok(())
@@ -165,13 +197,13 @@ fn resource_identity(resource: &Resource) -> Result<String> {
 fn validate_identity(identity: &str, path: &Path) -> Result<()> {
     let Some((kind, name)) = identity.split_once(':') else {
         bail!(
-            "Claude resource ownership state has invalid identity `{identity}` in {}",
+            "Agent resource ownership state has invalid identity `{identity}` in {}",
             path.display()
         );
     };
     if !matches!(kind, "skill" | "rule") || require_safe_name(name).is_err() {
         bail!(
-            "Claude resource ownership state has invalid identity `{identity}` in {}",
+            "Agent resource ownership state has invalid identity `{identity}` in {}",
             path.display()
         );
     }
@@ -185,17 +217,17 @@ fn require_safe_name(name: &str) -> Result<()> {
         (Some(Component::Normal(component)), None) if component == OsStr::new(name)
     );
     if !safe {
-        bail!("Claude resource ownership name `{name}` must be one path component");
+        bail!("Agent resource ownership name `{name}` must be one path component");
     }
     Ok(())
 }
 
-fn validate_destination(claude_root: &Path, destination: &Path, path: &Path) -> Result<()> {
-    let relative = destination.strip_prefix(claude_root).with_context(|| {
+fn validate_destination(root: &Path, destination: &Path, path: &Path) -> Result<()> {
+    let relative = destination.strip_prefix(root).with_context(|| {
         format!(
-            "Claude resource ownership destination {} is outside {} in {}",
+            "Agent resource ownership destination {} is outside {} in {}",
             destination.display(),
-            claude_root.display(),
+            root.display(),
             path.display()
         )
     })?;
@@ -208,7 +240,7 @@ fn validate_destination(claude_root: &Path, destination: &Path, path: &Path) -> 
         })
     {
         bail!(
-            "Claude resource ownership destination {} is invalid in {}",
+            "Agent resource ownership destination {} is invalid in {}",
             destination.display(),
             path.display()
         );
@@ -235,13 +267,13 @@ fn ensure_safe_state_path(path: &Path) -> Result<()> {
     };
     if metadata.file_type().is_symlink() {
         bail!(
-            "refusing to read or replace symlinked Claude resource ownership state {}",
+            "refusing to read or replace symlinked Agent resource ownership state {}",
             path.display()
         );
     }
     if !metadata.is_file() {
         bail!(
-            "Claude resource ownership state path {} is not a regular file",
+            "Agent resource ownership state path {} is not a regular file",
             path.display()
         );
     }
@@ -379,6 +411,6 @@ mod tests {
 
         let error = ClaudeResourceOwnership::load(&paths).unwrap_err();
 
-        assert!(error.to_string().contains("symlinked Claude resource"));
+        assert!(error.to_string().contains("symlinked Agent resource"));
     }
 }

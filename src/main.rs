@@ -61,6 +61,10 @@ struct PathArgs {
 
     #[arg(long, env = "AGENT_SYNC_AGENTS_HOME")]
     agents_home: Option<PathBuf>,
+    #[arg(long, env = "AGENT_SYNC_AMP_HOME")]
+    amp_home: Option<PathBuf>,
+    #[arg(long, env = "AGENT_SYNC_AMP_CONFIG")]
+    amp_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -331,6 +335,7 @@ enum SourceArg {
     Codex,
     Claude,
     Cursor,
+    Amp,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -338,6 +343,7 @@ enum ManagedSourceArg {
     Codex,
     Claude,
     Cursor,
+    Amp,
 }
 
 struct AppContext {
@@ -403,7 +409,7 @@ struct BackgroundInspection {
 impl AppContext {
     fn from_path_args(args: PathArgs) -> Result<Self> {
         let config_override = args.config;
-        let paths = AgentPaths::from_optional(
+        let mut paths = AgentPaths::from_optional(
             args.home,
             args.codex_home,
             args.claude_home,
@@ -412,6 +418,13 @@ impl AppContext {
             args.cursor_config,
             args.agents_home,
         )?;
+        if let Some(home) = args.amp_home {
+            paths.amp_home = home;
+            paths.amp_config = paths.amp_home.join("settings.json");
+        }
+        if let Some(config) = args.amp_config {
+            paths.amp_config = config;
+        }
         let config_path = resolve_config_path(&paths.home, config_override.as_deref());
         Ok(Self { paths, config_path })
     }
@@ -875,7 +888,12 @@ fn build_setup_screen(
     let inventory = discover(&context.paths)?;
     Ok(SetupScreen {
         available_sources: available_source_agents(&context.paths),
-        target_agents: vec![TuiAgent::Codex, TuiAgent::Claude, TuiAgent::Cursor],
+        target_agents: vec![
+            TuiAgent::Codex,
+            TuiAgent::Claude,
+            TuiAgent::Cursor,
+            TuiAgent::Amp,
+        ],
         preserve_initial_source: context.config_path.exists(),
         mcp_servers: vec![
             AgentMcpServers {
@@ -890,6 +908,10 @@ fn build_setup_screen(
                 agent: TuiAgent::Cursor,
                 servers: inventory.cursor.mcp_servers,
             },
+            AgentMcpServers {
+                agent: TuiAgent::Amp,
+                servers: inventory.amp.mcp_servers,
+            },
         ],
         qmd_available: qmd_executable(&context.paths).is_some(),
         include_references: config.include_references,
@@ -903,6 +925,7 @@ fn available_source_agents(paths: &AgentPaths) -> Vec<TuiAgent> {
         (TuiAgent::Codex, paths.codex_home.as_path()),
         (TuiAgent::Claude, paths.claude_home.as_path()),
         (TuiAgent::Cursor, paths.cursor_home.as_path()),
+        (TuiAgent::Amp, paths.amp_home.as_path()),
     ]
     .into_iter()
     .filter_map(|(agent, path)| path.is_dir().then_some(agent))
@@ -1162,6 +1185,7 @@ fn tui_agent_from_kind(agent: AgentKind) -> TuiAgent {
         AgentKind::Codex => TuiAgent::Codex,
         AgentKind::Claude => TuiAgent::Claude,
         AgentKind::Cursor => TuiAgent::Cursor,
+        AgentKind::Amp => TuiAgent::Amp,
     }
 }
 
@@ -1170,6 +1194,7 @@ fn agent_kind_from_tui(agent: TuiAgent) -> AgentKind {
         TuiAgent::Codex => AgentKind::Codex,
         TuiAgent::Claude => AgentKind::Claude,
         TuiAgent::Cursor => AgentKind::Cursor,
+        TuiAgent::Amp => AgentKind::Amp,
     }
 }
 
@@ -1178,6 +1203,7 @@ fn canonical_source_from_tui(agent: TuiAgent) -> Result<CanonicalSource> {
         TuiAgent::Codex => Ok(CanonicalSource::Codex),
         TuiAgent::Claude => Ok(CanonicalSource::Claude),
         TuiAgent::Cursor => Ok(CanonicalSource::Cursor),
+        TuiAgent::Amp => Ok(CanonicalSource::Amp),
     }
 }
 
@@ -1500,7 +1526,7 @@ fn run_schedule(context: &AppContext, command: ScheduleCommand) -> Result<()> {
 fn schedule_spec(context: &AppContext, executable: impl Into<PathBuf>) -> Result<ScheduleSpec> {
     let working_directory =
         std::env::current_dir().context("resolve schedule working directory")?;
-    let path_arguments = [
+    let mut path_arguments = vec![
         (
             "--config",
             absolute_schedule_path(&context.config_path, &working_directory),
@@ -1534,6 +1560,18 @@ fn schedule_spec(context: &AppContext, executable: impl Into<PathBuf>) -> Result
             absolute_schedule_path(&context.paths.agents_home, &working_directory),
         ),
     ];
+    if context.paths.amp_home != context.paths.home.join(".config/amp")
+        || context.paths.amp_config != context.paths.amp_home.join("settings.json")
+    {
+        path_arguments.push((
+            "--amp-home",
+            absolute_schedule_path(&context.paths.amp_home, &working_directory),
+        ));
+        path_arguments.push((
+            "--amp-config",
+            absolute_schedule_path(&context.paths.amp_config, &working_directory),
+        ));
+    }
     let mut arguments = Vec::with_capacity(path_arguments.len() * 2);
     for (flag, path) in path_arguments {
         arguments.push(flag.to_string());
@@ -1604,6 +1642,7 @@ impl From<SourceArg> for SourceSelection {
             SourceArg::Codex => SourceSelection::Codex,
             SourceArg::Claude => SourceSelection::Claude,
             SourceArg::Cursor => SourceSelection::Cursor,
+            SourceArg::Amp => SourceSelection::Amp,
         }
     }
 }
@@ -1614,6 +1653,7 @@ impl From<ManagedSourceArg> for CanonicalSource {
             ManagedSourceArg::Codex => CanonicalSource::Codex,
             ManagedSourceArg::Claude => CanonicalSource::Claude,
             ManagedSourceArg::Cursor => CanonicalSource::Cursor,
+            ManagedSourceArg::Amp => CanonicalSource::Amp,
         }
     }
 }
@@ -1629,7 +1669,10 @@ fn parse_targets(raw: &str) -> Result<Vec<AgentKind>> {
             "codex" => AgentKind::Codex,
             "claude" => AgentKind::Claude,
             "cursor" => AgentKind::Cursor,
-            other => anyhow::bail!("unknown target `{other}`; expected codex, claude, or cursor"),
+            "amp" => AgentKind::Amp,
+            other => {
+                anyhow::bail!("unknown target `{other}`; expected codex, claude, cursor, or amp")
+            }
         };
         if !out.contains(&target) {
             out.push(target);
@@ -1707,6 +1750,50 @@ mod tests {
             available_source_agents(&paths),
             vec![TuiAgent::Codex, TuiAgent::Cursor]
         );
+        std::fs::create_dir_all(&paths.amp_home).unwrap();
+        assert_eq!(
+            available_source_agents(&paths),
+            vec![TuiAgent::Codex, TuiAgent::Cursor, TuiAgent::Amp]
+        );
+    }
+
+    #[test]
+    fn amp_cli_routes_and_path_overrides_are_available_to_schedules() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_str().unwrap();
+        let cli = Cli::try_parse_from([
+            "agent-sync",
+            "--home",
+            home,
+            "--amp-home",
+            "custom-amp",
+            "--amp-config",
+            "custom-settings.json",
+            "setup",
+            "--from",
+            "amp",
+            "--to",
+            "codex,claude,cursor",
+        ])
+        .unwrap();
+        let context = AppContext::from_path_args(cli.paths).unwrap();
+        assert_eq!(context.paths.amp_home, PathBuf::from("custom-amp"));
+        assert_eq!(
+            context.paths.amp_config,
+            PathBuf::from("custom-settings.json")
+        );
+        let Some(Command::Setup(args)) = cli.command else {
+            panic!("expected setup")
+        };
+        let config = build_setup_config(&context.config_path, &args).unwrap();
+        assert_eq!(config.source, CanonicalSource::Amp);
+        assert_eq!(parse_targets("amp").unwrap(), vec![AgentKind::Amp]);
+        let spec = schedule_spec(&context, std::env::current_exe().unwrap()).unwrap();
+        let plist = String::from_utf8(agent_sync::render_launch_agent(&spec).unwrap()).unwrap();
+        assert!(plist.contains("<string>--amp-home</string>"));
+        assert!(plist.contains("custom-amp</string>"));
+        assert!(plist.contains("<string>--amp-config</string>"));
+        assert!(plist.contains("custom-settings.json</string>"));
     }
 
     #[test]

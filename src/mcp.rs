@@ -47,6 +47,91 @@ enum JsonMcpFlavor {
 pub(crate) type JsonMcpSnapshot = (Option<Vec<u8>>, BTreeMap<String, Value>);
 pub(crate) type CursorMcpSnapshot = JsonMcpSnapshot;
 
+pub fn discover_amp_mcp(path: &Path) -> Result<BTreeMap<String, McpServer>> {
+    discover_amp_mcp_with_policy(path, None)
+}
+
+pub(crate) fn discover_amp_mcp_for_export(
+    path: &Path,
+    selected: &[String],
+) -> Result<BTreeMap<String, McpServer>> {
+    discover_amp_mcp_with_policy(path, Some(selected))
+}
+
+fn discover_amp_mcp_with_policy(
+    path: &Path,
+    selected: Option<&[String]>,
+) -> Result<BTreeMap<String, McpServer>> {
+    let (_, values) = read_amp_mcp_snapshot(path)?;
+    let mut servers = BTreeMap::new();
+    for (name, value) in values {
+        if selected.is_some_and(|selection| !mcp_selected(selection, &name)) {
+            continue;
+        }
+        if selected.is_some() {
+            validate_amp_mcp_value_for_export(&name, &value)?;
+        }
+        if let Some(server) = amp_mcp_server(&value) {
+            if selected.is_some() {
+                validate_mcp_server_for_export(&name, &server)?;
+            }
+            servers.insert(name, server);
+        }
+    }
+    Ok(servers)
+}
+
+fn validate_amp_mcp_value_for_export(name: &str, value: &Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("Amp MCP server must be an object")?;
+    for field in object.keys() {
+        if !["command", "args", "env", "url", "headers"].contains(&field.as_str()) {
+            bail!("MCP server `{name}` contains unsupported Amp field `{field}`");
+        }
+    }
+    validate_json_mcp_value_for_export(name, value, JsonMcpFlavor::Claude)
+}
+
+pub(crate) fn amp_mcp_server(value: &Value) -> Option<McpServer> {
+    mcp_from_json_value(value, JsonMcpFlavor::Claude)
+}
+
+pub(crate) fn amp_mcp_value(server: &McpServer) -> Result<Value> {
+    if !matches!(
+        server.transport,
+        Some(McpTransport::Stdio | McpTransport::Http | McpTransport::Sse)
+    ) {
+        bail!("Amp supports stdio and URL-based MCP servers");
+    }
+    if server.headers_helper.is_some() {
+        bail!("Amp does not support headersHelper");
+    }
+    let mut value = mcp_to_json_value(server, JsonMcpFlavor::Claude)?;
+    value.as_object_mut().unwrap().remove("type");
+    Ok(value)
+}
+
+pub(crate) fn read_amp_mcp_snapshot(path: &Path) -> Result<JsonMcpSnapshot> {
+    read_json_mcp_snapshot_with_key(path, "Amp", "amp.mcpServers")
+}
+
+pub(crate) fn render_amp_mcp_additive_with_updates(
+    path: &Path,
+    existing: Option<&[u8]>,
+    servers: &BTreeMap<String, McpServer>,
+    managed_updates: &BTreeSet<String>,
+) -> Result<Vec<u8>> {
+    render_json_mcp_additive_with_key(
+        path,
+        existing,
+        servers,
+        managed_updates,
+        ("Amp", "amp.mcpServers"),
+        amp_mcp_value,
+    )
+}
+
 pub fn discover_claude_mcp(path: &Path) -> Result<BTreeMap<String, McpServer>> {
     discover_claude_mcp_with_policy(path, None)
 }
@@ -212,28 +297,36 @@ pub(crate) fn read_claude_mcp_snapshot(path: &Path) -> Result<JsonMcpSnapshot> {
 }
 
 fn read_json_mcp_snapshot(path: &Path, agent: &str) -> Result<JsonMcpSnapshot> {
+    read_json_mcp_snapshot_with_key(path, agent, "mcpServers")
+}
+
+fn read_json_mcp_snapshot_with_key(path: &Path, agent: &str, key: &str) -> Result<JsonMcpSnapshot> {
     ensure_json_mcp_write_safe(path, agent)?;
     let raw = match fs::read(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok((None, BTreeMap::new())),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
-    let values = json_mcp_values_from_bytes(path, &raw)?;
+    let values = json_mcp_values_from_bytes_with_key(path, &raw, key)?;
     Ok((Some(raw), values))
 }
 
-fn json_mcp_values_from_bytes(path: &Path, raw: &[u8]) -> Result<BTreeMap<String, Value>> {
+fn json_mcp_values_from_bytes_with_key(
+    path: &Path,
+    raw: &[u8],
+    key: &str,
+) -> Result<BTreeMap<String, Value>> {
     let root: Value =
         serde_json::from_slice(raw).with_context(|| format!("parse {}", path.display()))?;
     let root = root
         .as_object()
         .with_context(|| format!("{} must contain a JSON object", path.display()))?;
-    let Some(servers) = root.get("mcpServers") else {
+    let Some(servers) = root.get(key) else {
         return Ok(BTreeMap::new());
     };
     let servers = servers
         .as_object()
-        .with_context(|| format!("{}.mcpServers must be a JSON object", path.display()))?;
+        .with_context(|| format!("{}.{key} must be a JSON object", path.display()))?;
     Ok(servers
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
@@ -479,11 +572,29 @@ fn render_json_mcp_additive_with_updates(
     managed_updates: &BTreeSet<String>,
     flavor: JsonMcpFlavor,
 ) -> Result<Vec<u8>> {
-    validate_mcp_servers_for_render(servers)?;
     let agent = match flavor {
         JsonMcpFlavor::Claude => "Claude",
         JsonMcpFlavor::Cursor => "Cursor",
     };
+    render_json_mcp_additive_with_key(
+        path,
+        existing,
+        servers,
+        managed_updates,
+        (agent, "mcpServers"),
+        |server| mcp_to_json_value(server, flavor),
+    )
+}
+
+fn render_json_mcp_additive_with_key(
+    path: &Path,
+    existing: Option<&[u8]>,
+    servers: &BTreeMap<String, McpServer>,
+    managed_updates: &BTreeSet<String>,
+    (agent, key): (&str, &str),
+    render: impl Fn(&McpServer) -> Result<Value>,
+) -> Result<Vec<u8>> {
+    validate_mcp_servers_for_render(servers)?;
     let raw = match existing {
         Some(raw) => std::str::from_utf8(raw)
             .with_context(|| format!("{} must contain UTF-8 JSON", path.display()))?,
@@ -496,11 +607,11 @@ fn render_json_mcp_additive_with_updates(
         .as_object()
         .with_context(|| format!("{} must contain a JSON object", path.display()))?;
     let configured_servers = root_object
-        .get("mcpServers")
+        .get(key)
         .map(|value| {
             value
                 .as_object()
-                .with_context(|| format!("{}.mcpServers must be a JSON object", path.display()))
+                .with_context(|| format!("{}.{key} must be a JSON object", path.display()))
         })
         .transpose()?;
     let missing = servers
@@ -511,13 +622,13 @@ fn render_json_mcp_additive_with_updates(
                 "{}:{}",
                 serde_json::to_string(name)?,
                 serde_json::to_string(
-                    &mcp_to_json_value(server, flavor)
+                    &render(server)
                         .with_context(|| format!("render MCP server `{name}` for {agent}"))?
                 )?
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let root_layout = inspect_json_object(raw, first_non_whitespace(raw)?, Some("mcpServers"))?;
+    let root_layout = inspect_json_object(raw, first_non_whitespace(raw)?, Some(key))?;
     let mcp_layout = root_layout
         .property_value
         .as_ref()
@@ -536,7 +647,7 @@ fn render_json_mcp_additive_with_updates(
             Ok((
                 property,
                 serde_json::to_string(
-                    &mcp_to_json_value(server, flavor)
+                    &render(server)
                         .with_context(|| format!("render MCP server `{name}` for {agent}"))?,
                 )?,
             ))
@@ -559,15 +670,19 @@ fn render_json_mcp_additive_with_updates(
             .with_context(|| format!("{agent} mcpServers layout was not inspected"))?;
         (
             layout.closing_brace,
-            if layout.has_members { "," } else { "" },
+            if layout.has_members {
+                ",".to_string()
+            } else {
+                String::new()
+            },
         )
     } else {
         (
             root_layout.closing_brace,
             if root_layout.has_members {
-                ",\"mcpServers\":{"
+                format!(",{}:{{", serde_json::to_string(key)?)
             } else {
-                "\"mcpServers\":{"
+                format!("{}:{{", serde_json::to_string(key)?)
             },
         )
     };
@@ -1593,6 +1708,80 @@ fn render_json_env_reference(flavor: JsonMcpFlavor, env_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amp_preserves_settings_and_target_owned_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let raw = br#"{"amp.theme":"dark","amp.mcpServers":{"owned":{"command":"keep","unknown":true},"managed":{"command":"old"}}}"#;
+        fs::write(&path, raw).unwrap();
+        let (snapshot, values) = read_amp_mcp_snapshot(&path).unwrap();
+        assert_eq!(values["owned"]["unknown"], true);
+        let server = McpServer {
+            transport: Some(McpTransport::Stdio),
+            command: Some("new".into()),
+            env: BTreeMap::from([("API_TOKEN".into(), "${API_TOKEN}".into())]),
+            ..Default::default()
+        };
+        let rendered = render_amp_mcp_additive_with_updates(
+            &path,
+            snapshot.as_deref(),
+            &BTreeMap::from([("managed".into(), server.clone()), ("added".into(), server)]),
+            &BTreeSet::from(["managed".into()]),
+        )
+        .unwrap();
+        let root: Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(root["amp.theme"], "dark");
+        assert_eq!(root["amp.mcpServers"]["owned"], values["owned"]);
+        assert_eq!(root["amp.mcpServers"]["managed"]["command"], "new");
+        assert_eq!(
+            root["amp.mcpServers"]["added"]["env"]["API_TOKEN"],
+            "${API_TOKEN}"
+        );
+        assert!(root["amp.mcpServers"]["added"].get("type").is_none());
+        fs::write(&path, rendered).unwrap();
+        let exported = discover_amp_mcp_for_export(&path, &["added".into()]).unwrap();
+        assert_eq!(exported["added"].env["API_TOKEN"], "${API_TOKEN}");
+    }
+
+    #[test]
+    fn amp_inserts_literal_dotted_key_and_rejects_unsupported_exports() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let server = McpServer {
+            transport: Some(McpTransport::Http),
+            url: Some("https://example.invalid/mcp".into()),
+            headers_env: BTreeMap::from([("X-Token".into(), "TOKEN".into())]),
+            ..Default::default()
+        };
+        let rendered = render_amp_mcp_additive_with_updates(
+            &path,
+            Some(br#"{"amp.theme":"dark"}"#),
+            &BTreeMap::from([("remote".into(), server)]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let root: Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(
+            root["amp.mcpServers"]["remote"]["headers"]["X-Token"],
+            "${TOKEN}"
+        );
+        assert!(root.get("amp").is_none());
+        for value in [
+            json!({"command":"server", "type":"stdio"}),
+            json!({"command":"server", "transport":"stdio"}),
+            json!({"url":"https://example.invalid", "headersHelper":"helper"}),
+            json!({"command":"server", "env":{"TOKEN":"raw-secret"}}),
+            json!({"command":"server", "env":{"ROOT":"${HOME}/bin"}}),
+            json!({"command":"server", "env":{"TOKEN":"${env:TOKEN}"}}),
+            json!({"url":"https://example.invalid", "headers":{"X-Token":"token ${TOKEN}"}}),
+        ] {
+            assert!(
+                validate_amp_mcp_value_for_export("unsafe", &value).is_err(),
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn codex_claude_and_cursor_round_trip_environment_and_bearer_references() {

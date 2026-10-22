@@ -69,6 +69,39 @@ fn run_output(root: &Path, args: &[&str]) -> Output {
     output
 }
 
+#[test]
+fn amp_managed_cli_route_previews_syncs_and_verifies() {
+    let temp = setup_fixture();
+    let root = temp.path();
+    write(
+        &root.join(".config/amp/skills/amp-only/SKILL.md"),
+        "---\nname: amp-only\ndescription: Amp workflow\n---\n\nUse the Amp workflow.\n",
+    );
+    write(
+        &root.join(".config/amp/AGENTS.md"),
+        "# Amp guidance\nKeep scope focused.\n",
+    );
+    write(
+        &root.join(".config/amp/settings.json"),
+        r#"{"amp.skills.disableGlobalAgentsSkills":true,"amp.skills.disableClaudeCodeSkills":true}"#,
+    );
+    run(
+        root,
+        &["setup", "--from", "amp", "--to", "codex,claude", "--yes"],
+    );
+    assert!(root.join(".config/amp/skills/agent-sync/SKILL.md").exists());
+    let preview = run(root, &["sync"]);
+    assert!(preview.contains("Add claude Skill:amp-only"), "{preview}");
+    assert!(!root.join(".claude/skills/amp-only/SKILL.md").exists());
+    run(root, &["sync", "--yes"]);
+    assert!(root.join(".claude/skills/amp-only/SKILL.md").exists());
+    assert!(root.join(".codex/skills/amp-only/SKILL.md").exists());
+    let status: Value = serde_json::from_str(&run(root, &["status", "--format", "json"])).unwrap();
+    assert_eq!(status["source"], "amp");
+    assert_eq!(status["healthy"], true);
+    assert!(run(root, &["doctor"]).contains("Agent sync is healthy"));
+}
+
 fn setup_fixture() -> TempDir {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();

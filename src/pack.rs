@@ -8,7 +8,7 @@ use crate::{
     fsx::{copy_dir_for_export, copy_file_for_export, ensure_dir, hash_path},
     manifest::{Manifest, Resource, ResourceKind},
     mcp::{
-        discover_claude_mcp_for_export, discover_codex_mcp_for_export,
+        discover_amp_mcp_for_export, discover_claude_mcp_for_export, discover_codex_mcp_for_export,
         discover_cursor_mcp_for_export, save_pack_mcp, McpServer,
     },
 };
@@ -19,6 +19,7 @@ pub enum SourceSelection {
     Codex,
     Claude,
     Cursor,
+    Amp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +124,11 @@ pub fn export_pack(
     } else {
         None
     };
+    let amp_inventory = if matches!(options.source, SourceSelection::All | SourceSelection::Amp) {
+        Some(discover_agent(paths, AgentKind::Amp, false)?)
+    } else {
+        None
+    };
     let shared_inventory =
         if codex_inventory.is_some() || claude_inventory.is_some() || cursor_inventory.is_some() {
             Some(discover_shared_agents(paths)?)
@@ -156,6 +162,9 @@ pub fn export_pack(
             "claude",
         )?;
     }
+    if let Some(inventory) = amp_inventory {
+        choose_inventory_skills(&mut chosen_skills, &mut manifest.warnings, inventory, "amp")?;
+    }
     if let Some(inventory) = shared_inventory {
         choose_inventory_skills(
             &mut chosen_skills,
@@ -178,7 +187,12 @@ pub fn export_pack(
             source_agent,
             pack_path: dest.strip_prefix(pack)?.to_string_lossy().to_string(),
             sha256: hash_path(&dest)?,
-            targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
+            targets: vec![
+                AgentKind::Codex,
+                AgentKind::Claude,
+                AgentKind::Cursor,
+                AgentKind::Amp,
+            ],
         });
     }
 
@@ -301,11 +315,47 @@ fn export_rules(
                 source_agent: "codex".to_string(),
                 pack_path: dest.strip_prefix(pack)?.to_string_lossy().to_string(),
                 sha256: hash_path(&dest)?,
-                targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
+                targets: vec![
+                    AgentKind::Codex,
+                    AgentKind::Claude,
+                    AgentKind::Cursor,
+                    AgentKind::Amp,
+                ],
             });
         }
     }
 
+    if matches!(options.source, SourceSelection::All | SourceSelection::Amp) {
+        // Both files are always loaded by Amp; combine them into one portable rule.
+        let dest = pack.join("rules/amp-agents.md");
+        let mut guidance = Vec::new();
+        for source in [
+            paths.amp_home.join("AGENTS.md"),
+            paths.home.join(".config/AGENTS.md"),
+        ] {
+            if !source.exists() {
+                continue;
+            }
+            copy_file_for_export(&source, &dest, "Amp agent rules")?;
+            guidance.push(fs::read_to_string(&dest)?);
+        }
+        if !guidance.is_empty() {
+            crate::fsx::write_atomic(&dest, guidance.join("\n\n").as_bytes())?;
+            manifest.resources.push(Resource {
+                kind: ResourceKind::Rule,
+                name: "amp-agents".to_string(),
+                source_agent: "amp".to_string(),
+                pack_path: dest.strip_prefix(pack)?.to_string_lossy().to_string(),
+                sha256: hash_path(&dest)?,
+                targets: vec![
+                    AgentKind::Codex,
+                    AgentKind::Claude,
+                    AgentKind::Cursor,
+                    AgentKind::Amp,
+                ],
+            });
+        }
+    }
     if matches!(
         options.source,
         SourceSelection::All | SourceSelection::Claude
@@ -320,7 +370,7 @@ fn export_rules(
                 source_agent: "claude".to_string(),
                 pack_path: dest.strip_prefix(pack)?.to_string_lossy().to_string(),
                 sha256: hash_path(&dest)?,
-                targets: vec![AgentKind::Claude],
+                targets: vec![AgentKind::Claude, AgentKind::Amp],
             });
         }
     }
@@ -427,6 +477,12 @@ fn export_mcp(
             servers.entry(name).or_insert(server);
         }
     }
+    if matches!(options.source, SourceSelection::All | SourceSelection::Amp) {
+        for (name, server) in discover_amp_mcp_for_export(&paths.amp_config, &options.mcp_servers)?
+        {
+            servers.entry(name).or_insert(server);
+        }
+    }
     if servers.is_empty() {
         return Ok(());
     }
@@ -439,7 +495,12 @@ fn export_mcp(
             source_agent: "mixed".to_string(),
             pack_path: "mcp/servers.json".to_string(),
             sha256: hash_path(&mcp_path)?,
-            targets: vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor],
+            targets: vec![
+                AgentKind::Codex,
+                AgentKind::Claude,
+                AgentKind::Cursor,
+                AgentKind::Amp,
+            ],
         });
     }
     Ok(())

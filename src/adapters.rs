@@ -13,6 +13,7 @@ pub enum AgentKind {
     Codex,
     Claude,
     Cursor,
+    Amp,
 }
 
 impl Display for AgentKind {
@@ -21,6 +22,7 @@ impl Display for AgentKind {
             AgentKind::Codex => f.write_str("codex"),
             AgentKind::Claude => f.write_str("claude"),
             AgentKind::Cursor => f.write_str("cursor"),
+            AgentKind::Amp => f.write_str("amp"),
         }
     }
 }
@@ -34,6 +36,8 @@ pub struct AgentPaths {
     pub cursor_home: PathBuf,
     pub cursor_config: PathBuf,
     pub agents_home: PathBuf,
+    pub amp_home: PathBuf,
+    pub amp_config: PathBuf,
 }
 
 impl AgentPaths {
@@ -54,6 +58,8 @@ impl AgentPaths {
         let cursor_home = cursor_home.unwrap_or_else(|| home.join(".cursor"));
         let cursor_config = cursor_config.unwrap_or_else(|| cursor_home.join("mcp.json"));
         let agents_home = agents_home.unwrap_or_else(|| home.join(".agents"));
+        let amp_home = home.join(".config/amp");
+        let amp_config = amp_home.join("settings.json");
 
         Ok(Self {
             home,
@@ -63,6 +69,8 @@ impl AgentPaths {
             cursor_home,
             cursor_config,
             agents_home,
+            amp_home,
+            amp_config,
         })
     }
 
@@ -75,7 +83,39 @@ impl AgentPaths {
             cursor_home: root.join(".cursor"),
             cursor_config: root.join(".cursor/mcp.json"),
             agents_home: root.join(".agents"),
+            amp_home: root.join(".config/amp"),
+            amp_config: root.join(".config/amp/settings.json"),
         }
+    }
+
+    /// Personal skill locations in Amp's documented precedence order.
+    pub fn amp_skill_dirs(&self) -> Result<Vec<PathBuf>> {
+        let settings: serde_json::Value = match std::fs::read(&self.amp_config) {
+            Ok(raw) => serde_json::from_slice(&raw)
+                .with_context(|| format!("parse {}", self.amp_config.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", self.amp_config.display()))
+            }
+        };
+        let mut directories = Vec::new();
+        if settings
+            .get("amp.skills.disableGlobalAgentsSkills")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            directories.push(self.home.join(".config/agents/skills"));
+            directories.push(self.agents_home.join("skills"));
+        }
+        directories.push(self.amp_home.join("skills"));
+        if settings
+            .get("amp.skills.disableClaudeCodeSkills")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            directories.push(self.claude_home.join("skills"));
+        }
+        Ok(directories)
     }
 }
 
