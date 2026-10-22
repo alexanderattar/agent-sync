@@ -8,7 +8,7 @@ terminal interface (TUI), then enable daily sync or ask your agent to run it.
 
 Supports Codex, Claude Code, Cursor, and Amp on macOS and Linux.
 **Amp support is currently on `main`; the latest release, v0.1.3, does not
-include it.** To use Amp now, [build from source](docs/reference.md#build-from-source).
+include it.** To use Amp now, build from source using the commands below.
 
 ## Install and set up
 
@@ -31,9 +31,22 @@ The installer verifies the download checksum. For stricter verification, see
 2. Choose your **targets**: the other agents you want to keep aligned.
 3. Select any MCP servers you want to copy. Leave Cursor history off unless
    you want searchable chat exports.
-4. Review and save setup. Saving setup alone does not run the first sync.
-5. Ask your configured agent: **“Preview and sync my agents.”** Review any
-   conflicts it reports, then ask it to check sync health.
+4. Review and save setup, then review the first-sync preview.
+5. Choose **Apply first sync** to apply and verify the changes, or **Finish
+   later** to save setup without syncing. You can then ask your configured
+   agent: **“Preview and sync my agents.”**
+
+Use the arrow keys to move, Space to toggle selections, and Enter to continue.
+The TUI guides you through:
+
+```text
+Choose source → Choose targets → Select MCP servers → Review setup
+             → Preview first sync → Apply and verify
+```
+
+For example, choose Codex as your source and Claude Code and Cursor as targets.
+After syncing, compatible skills from Codex are available in both targets.
+Conflicting target-owned files stay unchanged and are reported for review.
 
 Reopen `agent-sync` whenever you want the TUI's status and actions. You can use
 the absolute path above if `~/.local/bin` is not on your `PATH`.
@@ -73,7 +86,15 @@ request a macOS notification. Your Mac must be running and your user session
 available for the job to run. Check health if you suspect a missed run.
 
 Linux currently supports manual sync, but has no managed background service.
-See [schedule details and removal](docs/reference.md#background-sync-on-macos).
+In the TUI, select **Enable daily background sync** after your first successful
+sync and confirm the preview. Or use these commands:
+
+```bash
+agent-sync schedule install          # Preview
+agent-sync schedule install --yes    # Enable
+agent-sync schedule status           # Check the job
+agent-sync schedule uninstall --yes  # Disable
+```
 
 ## What syncs, and what stays local?
 
@@ -118,9 +139,65 @@ does not share your personal configuration.
 
 Distribute reviewed team skills through your team repository. Do not share
 raw personal exports without checking them for private context and paths.
-For a controlled rollout, [pin a release version](docs/reference.md#roll-it-out-to-a-team).
+For a controlled rollout, pin the version in your team's install command:
 
-## More help
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alexanderattar/agent-sync/releases/latest/download/agent-sync-installer.sh | sh -s -- --version v0.1.3
+```
+
+Test a new release on one machine before changing the team pin. The version
+above does not include Amp support.
+
+## If something looks wrong
+
+Ask your agent: **“Check agent-sync health and explain anything that isn't
+syncing.”** It can inspect the setup, preview changes, and diagnose failures.
+
+- **A skill is missing:** check that it exists in your source or shared skills
+  directory, then preview sync. A preserved conflict means the target has its
+  own copy; review the difference rather than forcing an overwrite.
+- **An MCP tool is unavailable:** check the selected server, local dependencies,
+  environment variables, and that agent's authentication. Sync does not log in.
+- **A daily run failed:** run `agent-sync doctor` and check the logs in
+  `~/.agent-sync/logs`. Fix the reported issue, then preview and rerun sync.
+- **You need to undo a change:** ask “Help me recover the last agent-sync
+  change.” Backups live in `~/.agent-sync/backups`; review a file-specific
+  recovery plan before restoring anything over newer edits.
+
+## Upgrade or remove
+
+Rerun the installation command to upgrade. Your configuration and synced files
+remain in place, and the daily job keeps using the installed binary path.
+
+To remove agent-sync, disable its daily job first on macOS, then uninstall:
+
+```bash
+agent-sync schedule uninstall --yes
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alexanderattar/agent-sync/releases/latest/download/agent-sync-installer.sh | sh -s -- --uninstall
+```
+
+Uninstall removes the binary, not your synced files, configuration, backups,
+logs, or chat exports. Private data under `~/.agent-sync` remains on disk.
+
+## Build from source
+
+With Rust and Cargo installed:
+
+```bash
+git clone https://github.com/alexanderattar/agent-sync.git
+cd agent-sync
+cargo build --release
+mkdir -p ~/.local/bin
+install -m 755 target/release/agent-sync ~/.local/bin/agent-sync
+~/.local/bin/agent-sync
+```
+
+The source build includes Amp support. Install it at a stable path before
+enabling a schedule.
+
+## Advanced reference
+
+Normal setup and daily use are covered above. For less common workflows:
 
 - [Upgrade or uninstall](docs/reference.md#upgrade-or-uninstall)
 - [Recovery and backups](docs/reference.md#recovery)
