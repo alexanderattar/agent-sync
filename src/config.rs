@@ -91,6 +91,7 @@ pub enum CanonicalSource {
     Codex,
     Claude,
     Cursor,
+    Amp,
 }
 
 impl CanonicalSource {
@@ -99,6 +100,7 @@ impl CanonicalSource {
             Self::Codex => AgentKind::Codex,
             Self::Claude => AgentKind::Claude,
             Self::Cursor => AgentKind::Cursor,
+            Self::Amp => AgentKind::Amp,
         }
     }
 }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     adapters::{AgentKind, AgentPaths},
     agent_skill::{
-        install_agent_skills, AgentSkillInstallAction, AgentSkillInstallOptions,
+        install_route_agent_skills, AgentSkillInstallAction, AgentSkillInstallOptions,
         AgentSkillInstallSetReport,
     },
     apply::{
@@ -101,7 +101,8 @@ pub fn setup_managed(
     ensure_regular_or_missing(config_path, "managed config")?;
     let rendered = render_config(config)?;
     let config_changed = read_to_string_if_exists(config_path)?.as_deref() != Some(&rendered);
-    let skill_preview = install_agent_skills(paths, AgentSkillInstallOptions { dry_run: true })?;
+    let skill_preview =
+        install_route_agent_skills(paths, config, AgentSkillInstallOptions { dry_run: true })?;
 
     if options.dry_run {
         return Ok(SetupReport {
@@ -142,7 +143,11 @@ pub fn setup_managed(
     } else {
         None
     };
-    let skill = match install_agent_skills(paths, AgentSkillInstallOptions { dry_run: false }) {
+    let skill = match install_route_agent_skills(
+        paths,
+        config,
+        AgentSkillInstallOptions { dry_run: false },
+    ) {
         Ok(report) => report,
         Err(error) => {
             let installed_sha256 = hash_bytes(rendered.as_bytes());
@@ -659,7 +664,8 @@ fn sync_inner(
         .collect::<Vec<_>>();
     progress.preserved = preserved.clone();
     progress.phase = "skill-preflight";
-    let skill_preview = install_agent_skills(paths, AgentSkillInstallOptions { dry_run: true })?;
+    let skill_preview =
+        install_route_agent_skills(paths, config, AgentSkillInstallOptions { dry_run: true })?;
     preserved.extend(
         skill_preview
             .installations
@@ -749,7 +755,8 @@ fn sync_inner(
     }
 
     progress.phase = "skill-reconcile";
-    let skill = install_agent_skills(paths, AgentSkillInstallOptions { dry_run: false })?;
+    let skill =
+        install_route_agent_skills(paths, config, AgentSkillInstallOptions { dry_run: false })?;
     let bundled_skill_changed = skill.action().has_writes();
     progress.bundled_skill_changed = bundled_skill_changed;
 
@@ -1060,7 +1067,7 @@ fn doctor_managed_with_config(
         checks.push("source, target, and MCP policy passed preflight".to_string());
     }
 
-    match install_agent_skills(paths, AgentSkillInstallOptions { dry_run: true }) {
+    match install_route_agent_skills(paths, config, AgentSkillInstallOptions { dry_run: true }) {
         Ok(report) => {
             for installation in report.installations {
                 let destination = installation.destination.display();
@@ -1463,6 +1470,7 @@ fn export_options(config: &Config) -> ExportOptions {
             CanonicalSource::Codex => SourceSelection::Codex,
             CanonicalSource::Claude => SourceSelection::Claude,
             CanonicalSource::Cursor => SourceSelection::Cursor,
+            CanonicalSource::Amp => SourceSelection::Amp,
         },
         include_references: config.include_references,
         include_mcp: config.mcp.mode != McpMode::None,
@@ -1479,6 +1487,7 @@ fn preflight(paths: &AgentPaths, config: &Config) -> Result<()> {
         CanonicalSource::Codex => &paths.codex_home,
         CanonicalSource::Claude => &paths.claude_home,
         CanonicalSource::Cursor => &paths.cursor_home,
+        CanonicalSource::Amp => &paths.amp_home,
     };
     if !source_root.is_dir() {
         bail!("source directory does not exist: {}", source_root.display());
@@ -1491,6 +1500,7 @@ fn preflight(paths: &AgentPaths, config: &Config) -> Result<()> {
             CanonicalSource::Codex => discover_codex_mcp(&paths.codex_home.join("config.toml"))?,
             CanonicalSource::Claude => discover_claude_mcp(&paths.claude_config)?,
             CanonicalSource::Cursor => discover_cursor_mcp(&paths.cursor_config)?,
+            CanonicalSource::Amp => crate::mcp::discover_amp_mcp(&paths.amp_config)?,
         };
         let missing = config
             .mcp

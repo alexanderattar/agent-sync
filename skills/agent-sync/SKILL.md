@@ -1,6 +1,6 @@
 ---
 name: agent-sync
-description: Set up, run, and diagnose agent-sync for Codex, Claude Code, and Cursor. Use when the user asks to sync agent configuration, keep agents aligned, check sync health or drift, repair agent-sync, or configure Cursor chat indexing.
+description: Set up, run, and diagnose agent-sync for Codex, Claude Code, Cursor, and Amp. Use when the user asks to sync agent configuration, keep agents aligned, check sync health or drift, repair agent-sync, or configure Cursor chat indexing.
 ---
 
 # Agent Sync
@@ -9,6 +9,7 @@ Use the installed `agent-sync` command. Resolve it with `command -v agent-sync` 
 
 - Start with `agent-sync status --format json`. If `configured` is `false`, route the request to setup. Read `cursor_history` as `disabled`, `export-only`, or `qmd`.
 - For setup or a policy change, run `agent-sync setup` with only the requested options. Existing options that are not specified are preserved. Review the printed policy. Run the same command with `--yes` only when the user requested setup or that policy change.
+- Amp is supported as `--from amp` or as an `amp` entry in `--to`. It uses `~/.config/amp` by default; preserve Amp-owned skills, personal guidance, and settings. Only selected portable MCP definitions are synced, using `amp.mcpServers`; account state and cloud threads are not transferred.
 - To sync agents, run `agent-sync sync` first. This previews additions, managed updates, and preserved target-owned conflicts. A `Skip` is intentional preservation and does not block unrelated additions. Use `agent-sync sync --yes` only when the user requested the write and the preview has no unexpected plain `Update`. Then run `agent-sync status`.
 - To repair Cursor chat indexing, inspect `cursor_history` in the JSON status. If it is `qmd`, preview and apply sync. If it is `disabled` or `export-only`, preview `agent-sync setup --refresh-qmd`, save that policy with `--yes` when the user requested indexing, and then preview and apply sync. Finish with `agent-sync doctor`.
 - For health, drift, or maintenance checks, run `agent-sync status`. Run `agent-sync doctor` when a check fails, is stale, or is unclear. Doctor exits nonzero when it finds a problem; use its output as the diagnosis.
